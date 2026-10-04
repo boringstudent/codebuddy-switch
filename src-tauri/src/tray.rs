@@ -359,9 +359,10 @@ fn exit_lightweight<R: Runtime>(app: &AppHandle<R>) {
 }
 
 fn open_github<R: Runtime>(app: &AppHandle<R>) {
-    let _ = app
-        .opener()
-        .open_url("https://github.com/changexbc/workbuddy-switch", None::<&str>);
+    let _ = app.opener().open_url(
+        "https://github.com/changexbc/workbuddy-switch",
+        None::<&str>,
+    );
 }
 
 struct CheckinBusyGuard<R: Runtime> {
@@ -718,15 +719,15 @@ fn format_checkin_tooltip(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
+    #[cfg(target_os = "macos")]
+    use super::tray_icon;
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
         should_keep_tray_alive, should_wake_main_window, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
-    #[cfg(target_os = "macos")]
-    use super::tray_icon;
-    #[cfg(windows)]
-    use super::taskbar_uses_light_theme;
     use serde_json::json;
 
     #[test]

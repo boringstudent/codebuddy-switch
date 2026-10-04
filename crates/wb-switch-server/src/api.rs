@@ -18,11 +18,10 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
-    export_import, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, session, switch, token_stats, travel,
-    variant::WbVariant, vscode_session,
+    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session,
+    codebuddy_ide_session_sync, config, credit_usage, credits, export_import, limits,
+    notifications, oauth, process, rate_limit_events, rate_limit_hook, refresh, session, switch,
+    token_stats, travel, variant::WbVariant, vscode_session,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -686,9 +685,7 @@ async fn api_account_sessions(RawQuery(query): RawQuery) -> Response {
             };
             json_ok(vscode_session::list_vscode_sessions(&uid))
         }
-        session::SessionClient::Workbuddy => {
-            json_ok(session::list_sessions_for_account(&account))
-        }
+        session::SessionClient::Workbuddy => json_ok(session::list_sessions_for_account(&account)),
         session::SessionClient::CodebuddyIde => json_err(
             "当前客户端暂不支持列出账号会话".to_string(),
             StatusCode::BAD_REQUEST,

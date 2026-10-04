@@ -8,11 +8,10 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits, error_log,
-    export_import, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, session, switch, token_stats, travel,
-    variant::WbVariant, vscode_session,
+    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session,
+    codebuddy_ide_session_sync, config, credit_usage, credits, error_log, export_import, limits,
+    notifications, oauth, process, rate_limit_events, rate_limit_hook, refresh, session, switch,
+    token_stats, travel, variant::WbVariant, vscode_session,
 };
 
 #[derive(Serialize)]
@@ -445,12 +444,8 @@ pub fn list_account_sessions(account_id: String, client: Option<String>) -> Resu
                 .ok_or("账号缺少 uid")?;
             Ok(vscode_session::list_vscode_sessions(&uid))
         }
-        session::SessionClient::Workbuddy => {
-            Ok(session::list_sessions_for_account(&account))
-        }
-        session::SessionClient::CodebuddyIde => {
-            Err("当前客户端暂不支持列出账号会话".to_string())
-        }
+        session::SessionClient::Workbuddy => Ok(session::list_sessions_for_account(&account)),
+        session::SessionClient::CodebuddyIde => Err("当前客户端暂不支持列出账号会话".to_string()),
     }
 }
 
