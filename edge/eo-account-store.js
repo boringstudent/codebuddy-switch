@@ -30,8 +30,11 @@
 const ACCOUNTS_JSON = [];
 // ▲▲▲ 部署时替换为你的账号数据 ▲▲▲
 
-/** 读取环境变量（兼容 EO 多种注入形态：全局变量 / globalThis.env）。 */
-function getEnv(name) {
+/** 读取环境变量（兼容 EO 多种注入形态：全局变量 / globalThis.env / fetch event.env）。 */
+function getEnv(name, event) {
+  if (event && event.env && typeof event.env[name] === 'string' && event.env[name]) {
+    return event.env[name];
+  }
   if (typeof globalThis !== 'undefined') {
     if (typeof globalThis[name] === 'string' && globalThis[name]) return globalThis[name];
     if (globalThis.env && typeof globalThis.env[name] === 'string' && globalThis.env[name]) {
@@ -40,8 +43,6 @@ function getEnv(name) {
   }
   return '';
 }
-
-const ACCESS_KEY = getEnv('ACCESS_KEY');
 
 function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
@@ -71,23 +72,24 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-async function handleRequest(request) {
+async function handleRequest(request, event) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
+  const accessKey = getEnv('ACCESS_KEY', event);
 
   if (request.method === 'GET' && path === '/health') {
-    return json({ ok: true, accounts: ACCOUNTS_JSON.length, keyConfigured: Boolean(ACCESS_KEY) });
+    return json({ ok: true, accounts: ACCOUNTS_JSON.length, keyConfigured: Boolean(accessKey) });
   }
 
   if (path === '/accounts') {
     if (request.method !== 'GET') {
       return json({ error: 'method not allowed' }, 405, { Allow: 'GET' });
     }
-    if (!ACCESS_KEY) {
+    if (!accessKey) {
       // 未配置 ACCESS_KEY 时一律拒绝（默认安全，绝不匿名放行）。
       return json({ error: 'server not configured' }, 500);
     }
-    if (!safeEqual(requestKey(request), ACCESS_KEY)) {
+    if (!safeEqual(requestKey(request), accessKey)) {
       return json({ error: 'unauthorized' }, 401);
     }
     return new Response(JSON.stringify(ACCOUNTS_JSON), {
@@ -103,5 +105,5 @@ async function handleRequest(request) {
 }
 
 addEventListener('fetch', (event) => {
-  event.respondWith(handleRequest(event.request));
+  event.respondWith(handleRequest(event.request, event));
 });
