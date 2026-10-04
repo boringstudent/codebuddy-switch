@@ -12,18 +12,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { buildGroups, SessionCopyTab } from "@/components/session-copy-tab";
-import type { SessionLinksMeta } from "@/components/session-link-shared";
-import { VscodeSessionSyncSection } from "@/components/vscode-session-sync-section";
 import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
 import type {
   AccountMeta,
   CodeBuddyCnIdeStatus,
-  SessionLinkPreviewGroup,
-  SessionSyncSelection,
   VscodeSession,
   VscodeSessionRef,
   WbVariant,
@@ -49,22 +44,10 @@ interface Props {
   onDone?: () => void;
 }
 
-/** tab 样式：下划线指示 + 可选计数徽标（与 VS Code / WorkBuddy 切号弹窗一致）。 */
-const TAB_TRIGGER_CLASS =
-  "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
-
-/** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
-function tabCount(count: number) {
-  return count > 0 ? (
-    <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
-  ) : null;
-}
-
 /**
  * CodeBuddy IDE 会话切换弹窗：可勾选「当前 IDE 账号」的会话复制到目标账号。
  *
- * 国内版与国际版共用本组件（差异只有三处 API 通道，按 `variant` 分流），与 VS Code 插件弹窗
- * 同形（关联会话 / 复制会话两个 tab），差异：
+ * 国内版与国际版共用本组件（差异只有 API 通道，按 `variant` 分流）：
  * - 切换固定走「关闭并重开 IDE」（`restart = true`），不提供自动关闭开关；
  * - 复制默认沿用会话 id，仅目标已有同 id 时改用新 id（后端决定，前端只提交引用）。
  */
@@ -82,14 +65,6 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  /** 当前 tab：与 VS Code 切换弹窗同一顺序与默认值（关联会话在前）。 */
-  const [tab, setTab] = useState<"links" | "copy">("links");
-  /** 关联会话区块上报的状态（tab 徽标 / 未登录时隐藏 tab）。 */
-  const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
-  /** 勾选提交给后端的同步选择（绑定预览凭据，执行前后端会重新校验）。 */
-  const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
-  /** 已勾选的关联会话（结果反馈里回显会话名）。 */
-  const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
 
   // 打开时加载「当前 IDE 账号」可复制的会话。
   useEffect(() => {
@@ -166,32 +141,15 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
             .filter((ref): ref is VscodeSessionRef => ref !== null)
         : undefined;
 
-      // IDE 切换固定「关闭 + 写入 + 重开」；勾选绑定预览凭据，执行前后端会重新校验。
+      // IDE 切换固定「关闭 + 写入 + 重开」。
       const res = intl
-        ? await api.switchCodebuddyIdeAccount(
-            account.id,
-            true,
-            refs,
-            syncSelections.length > 0 ? syncSelections : undefined,
-          )
-        : await api.switchCodebuddyCnIdeAccount(
-            account.id,
-            true,
-            refs,
-            syncSelections.length > 0 ? syncSelections : undefined,
-          );
+        ? await api.switchCodebuddyIdeAccount(account.id, true, refs)
+        : await api.switchCodebuddyCnIdeAccount(account.id, true, refs);
       const nickname = displayName(account);
       const copied = res.sessionCopy?.copied.length ?? 0;
       const errors = res.sessionCopy?.errors ?? [];
-      const linkErrors = res.sessionCopy?.linkErrors ?? [];
-      const syncReport = res.sessionSync;
-      const syncedItems = syncReport?.synced ?? [];
-      const skippedItems = syncReport?.skipped ?? [];
-      const syncErrors = syncReport?.errors ?? [];
       const restartHint = res.message || "已重启 CodeBuddy IDE";
       const copiedHint = copied > 0 ? `已复制 ${copied} 个会话` : null;
-      const syncedHint = syncedItems.length > 0 ? `已同步 ${syncedItems.length} 个会话` : null;
-      const requestedSync = syncSelections.length > 0;
 
       if (errors.length > 0) {
         toast.warning(`已切换至「${nickname}」，但部分会话未复制`, {
@@ -203,37 +161,7 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
         });
       } else {
         toast.success(`已切换至「${nickname}」`, {
-          description: [copiedHint, syncedHint, restartHint].filter(Boolean).join("；"),
-        });
-      }
-      // 复制成功但登记失败：复制本身有效，必须提示「未建立关联」而不是当成完整成功。
-      if (linkErrors.length > 0) {
-        toast.warning("部分会话已复制但未建立关联", {
-          description: [
-            ...linkErrors.map((item) => `${item.conversationId ?? "会话"}：${item.error}`),
-            "未建立关联的会话不会出现在「关联会话」列表里。",
-          ].join("；"),
-        });
-      }
-      // 同步结果：成功、跳过、失败都要能看到，不能只显示成功数。
-      const groupLabel = (groupId: string) =>
-        syncGroups.find((group) => group.groupId === groupId)?.title || groupId;
-      const syncIssues = [
-        ...syncErrors.map(
-          (item) => `${item.groupId ? groupLabel(item.groupId) : "全部会话"}：${item.error}`,
-        ),
-        // 预览过期/前置条件变化一律跳过并给出原因，绝不显示成已同步。
-        ...skippedItems.map((item) => `${groupLabel(item.groupId)}：${item.message}`),
-      ];
-      if (syncIssues.length > 0) {
-        if (syncErrors.length > 0) {
-          toast.error("部分关联会话没有同步（失败或已跳过）", { description: syncIssues.join("；") });
-        } else {
-          toast.warning("有关联会话没有同步（已跳过）", { description: syncIssues.join("；") });
-        }
-      } else if (requestedSync && !syncReport) {
-        toast.warning("关联会话未同步", {
-          description: "没有收到同步结果：当前版本可能不支持同步关联会话；账号已切换，但会话没有同步。",
+          description: [copiedHint, restartHint].filter(Boolean).join("；"),
         });
       }
       onOpenChange(false);
@@ -247,36 +175,21 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
 
   const copyCount = copyEnabled ? selected.size : 0;
   const hasCopyable = groups.length > 0;
-  const syncCount = syncSelections.length;
-  /** 覆盖项数量：底部摘要据此提示风险。 */
-  const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
-  /** 关联会话 tab 是否可用：区块不可用（能力判定不通过）时回落到仅复制会话。 */
-  const linksAvailable = linksMeta?.available ?? true;
   const running = ideStatus?.running === true;
   const summaryMain =
-    copyCount > 0 && syncCount > 0
-      ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
-      : copyCount > 0
-        ? `将复制 ${copyCount} 个会话`
-        : syncCount > 0
-          ? `将同步 ${syncCount} 个关联会话`
-          : "本次仅切换账号";
+    copyCount > 0
+      ? `将复制 ${copyCount} 个会话`
+      : "本次仅切换账号";
   // 国际版不再有独立确认框，不勾选时由底部摘要承担「将重启 IDE」的说明。
   // 国内版文案保持原句，不在这里改。
   const summarySub =
-    overwriteCount > 0
-      ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
-      : copyCount === 0 && syncCount === 0
-        ? intl
-          ? running
-            ? "未选择复制或同步会话，确认后将关闭并重启 IDE"
-            : "未选择复制或同步会话，确认后将打开 IDE"
-          : "未选择复制或同步会话"
-        : copyCount === 0
-          ? "未选择复制会话"
-          : syncCount === 0
-            ? "未选择同步会话"
-            : null;
+    copyCount === 0
+      ? intl
+        ? running
+          ? "未选择复制会话，确认后将关闭并重启 IDE"
+          : "未选择复制会话，确认后将打开 IDE"
+        : "未选择复制会话"
+      : null;
   /** IDE 未登录（`loggedIn === false`）：按新登录写入，仅影响提示文案。 */
   const notLoggedIn = ideStatus?.loggedIn === false;
   /** 未登录时的追加说明（tooltip 第二段）。 */
@@ -300,12 +213,7 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
         warning: false,
       };
 
-  // 关联 tab 不可用（能力判定不通过）时回落到复制会话，避免停在空 tab。
-  useEffect(() => {
-    if (!linksAvailable && tab === "links") setTab("copy");
-  }, [linksAvailable, tab]);
-
-  // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
+  // 「复制会话」内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
     <SessionCopyTab
       loading={loadingSessions}
@@ -367,7 +275,7 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
             </div>
           </div>
           <DialogDescription>
-            将把所选账号写入 CodeBuddy IDE；可选把当前账号的会话复制过去，并把关联会话的新内容同步过去。
+            将把所选账号写入 CodeBuddy IDE；可选把当前账号的会话复制过去。
           </DialogDescription>
         </DialogHeader>
 
@@ -377,9 +285,7 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
             <p className="text-sm font-medium">
               {copyCount > 0
                 ? "正在关闭 CodeBuddy IDE 并复制会话…"
-                : syncCount > 0
-                  ? "正在关闭 CodeBuddy IDE 并同步会话…"
-                  : "正在关闭 CodeBuddy IDE 并写入凭证…"}
+                : "正在关闭 CodeBuddy IDE 并写入凭证…"}
             </p>
             <p className="max-w-xs text-center text-xs text-muted-foreground">
               若 IDE 弹出保存提示请先处理（最长等待 60 秒）
@@ -388,58 +294,7 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
         )}
 
         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
-          {linksAvailable ? (
-            <Tabs
-              value={tab}
-              onValueChange={(value) => setTab(value as "links" | "copy")}
-              className="flex min-h-0 flex-col gap-3 overflow-hidden"
-            >
-              <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
-                <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
-                  关联会话
-                  {tabCount(linksMeta?.groupCount ?? 0)}
-                </TabsTrigger>
-                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
-                  复制会话
-                  {tabCount(copyCount)}
-                </TabsTrigger>
-              </TabsList>
-              {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
-              <TabsContent
-                value="copy"
-                forceMount
-                className="min-h-0 space-y-3 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
-              >
-                {copyTabContent}
-              </TabsContent>
-              <TabsContent
-                value="links"
-                forceMount
-                className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
-              >
-                <VscodeSessionSyncSection
-                  open={open}
-                  account={account}
-                  loggedIn={!notLoggedIn}
-                  disabled={busy}
-                  // 两个 IDE 共用展示件，只有预览通道按档位分流（稳定引用：模块级函数）。
-                  fetchPreview={
-                    intl
-                      ? api.codebuddyIntlIdeSessionLinksPreview
-                      : api.codebuddyIdeSessionLinksPreview
-                  }
-                  loggedOutHint="未检测到 CodeBuddy IDE 当前登录账号，请先在 CodeBuddy IDE 中登录后再切换。"
-                  onChange={(state) => {
-                    setSyncSelections(state.selections);
-                    setSyncGroups(state.groups);
-                  }}
-                  onMetaChange={setLinksMeta}
-                />
-              </TabsContent>
-            </Tabs>
-          ) : (
-            <div className="min-h-0 space-y-3 overflow-y-auto">{copyTabContent}</div>
-          )}
+          <div className="min-h-0 space-y-3 overflow-y-auto">{copyTabContent}</div>
 
           {error && (
             <Alert variant="destructive" className="min-w-0 break-all">
@@ -457,10 +312,10 @@ export function CodebuddyIdeSwitchAccountDialog({ open, onOpenChange, account, v
             <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
               取消
             </Button>
-            {/* 勾了复制却没选会话时仍然拦住；只要还有同步项可执行就允许确认。 */}
+            {/* 勾了复制却没选会话时仍然拦住。 */}
             <Button
               onClick={doSwitch}
-              disabled={busy || (copyEnabled && copyCount === 0 && syncCount === 0)}
+              disabled={busy || (copyEnabled && copyCount === 0)}
             >
               {busy ? "切换中…" : "确认切换"}
             </Button>

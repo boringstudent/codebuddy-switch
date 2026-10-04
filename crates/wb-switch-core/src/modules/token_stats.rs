@@ -542,6 +542,9 @@ impl SourceCollector {
 /// `detail` additionally keeps a bounded window of per-call request rows; both
 /// outputs share the same decode, cutoff, dedupe, and `subagents`-exclusion
 /// pipeline so a detail row can never disagree with the aggregate totals.
+///
+/// 仅测试使用的单根便捷封装（生产路径统一走 `source_from_roots`）。
+#[cfg(test)]
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
     source_from_roots(std::slice::from_ref(&root), name, cutoff, detail)
 }
@@ -1075,11 +1078,9 @@ fn ide_source(
     collector.into_value(name, paths.len())
 }
 
-/// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
-/// CodeBuddy IDE aggregates.
+/// Return independent WorkBuddy (CN) and CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
     let range_days = match days {
         Some(7) => Some(7),
@@ -1094,10 +1095,6 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         "rangeDays": range_days,
         "sources": [
             source_from_roots(&variant_source_roots(WbVariant::Cn), "workbuddy", cutoff, false),
-            // 国际版独立 source：不与国内版混算（不同账号体系）。
-            source_from_roots(&variant_source_roots(WbVariant::Ai), "workbuddy-ai", cutoff, false),
-            // 请求明细目前只对 CodeBuddy CLI 开放（见 spec 的 requests 契约）。
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, true),
             ide_source(
                 codebuddy_extension_data_dir(),
                 "codebuddy-ide",
@@ -2095,23 +2092,15 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_four_isolated_sources() {
+    fn get_statistics_returns_two_isolated_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "workbuddy",
-                "workbuddy-ai",
-                "codebuddy-cli",
-                "codebuddy-ide"
-            ]
-        );
-        // 国际版与国内版是两个独立 source，不合并。
+        assert_eq!(names, ["workbuddy", "codebuddy-ide"]);
+        // 两个 source 相互独立，不合并。
         assert_ne!(sources[0]["source"], sources[1]["source"]);
     }
 

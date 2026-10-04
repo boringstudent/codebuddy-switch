@@ -115,24 +115,6 @@ fn conversation_dir(
         .join(conversation_id)
 }
 
-/// Resolve one explicitly identified session without consulting the client's active login UID.
-/// The opaque workspace hash is returned only as a display locator; it is never decoded.
-pub(crate) fn session_location_and_content(
-    spec: SessionStoreSpec,
-    root: &Path,
-    uid: &str,
-    conversation_id: &str,
-) -> Option<(String, String, ContentState)> {
-    let index = conversation_index(spec, root, uid);
-    let locator = index.get(conversation_id)?;
-    let dir = conversation_dir(spec, root, uid, &locator.workspace_hash, conversation_id);
-    Some((
-        locator.workspace_hash.clone(),
-        locator.title.clone(),
-        vscode_session_link::read_session_content(&dir, conversation_id),
-    ))
-}
-
 /// 一次预览 / 同步内不变的输入：数据仓、账号、数据根与两侧会话定位索引。
 struct SyncContext<'a> {
     spec: SessionStoreSpec,

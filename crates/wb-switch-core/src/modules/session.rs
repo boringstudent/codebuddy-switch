@@ -8565,3 +8565,32 @@ mod tests {
         assert_eq!(body_bytes(&env, &target_id), target_before);
     }
 }
+
+/// 会话客户端类型（原 `session_groups::SessionClient`，关联会话功能删除后仅保留
+/// 「按客户端列出账号会话」所需的解析）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionClient {
+    Workbuddy,
+    CodebuddyIde,
+    VscodeExt,
+}
+
+impl SessionClient {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "workbuddy" => Ok(Self::Workbuddy),
+            "codebuddyIde" => Ok(Self::CodebuddyIde),
+            "vscodeExt" => Ok(Self::VscodeExt),
+            _ => Err("不支持的会话客户端".to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workbuddy => "workbuddy",
+            Self::CodebuddyIde => "codebuddyIde",
+            Self::VscodeExt => "vscodeExt",
+        }
+    }
+}

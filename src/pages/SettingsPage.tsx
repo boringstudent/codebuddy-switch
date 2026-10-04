@@ -1,17 +1,13 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import {
-  ArrowUpCircle,
   ChevronDown,
   CircleCheck,
-  ExternalLink,
   Loader2,
-  RefreshCw,
-  Save,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,31 +29,21 @@ import { TimePicker } from "@/components/ui/time-picker";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import { canPersistErrorLog } from "@/lib/error-report";
-import { setSessionsNavEnabled, useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import { SUPPORTED_TOOLS, setToolEnabled, useSupportedTools, type ToolId } from "@/lib/supported-tools";
 import type {
   AccountMeta,
   AppNotification,
-  AutoRotateConfig,
   CheckinConfig,
   CheckinLog,
-  GithubConfig,
   RateLimitConfig,
   RateLimitHookStatus,
-  RotateLog,
-  RotateStatus,
   TravelConfig,
-  UpdateInfo,
 } from "@/lib/types";
-import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
-import { useUpdateState } from "@/lib/use-update-state";
-import { changeCompanionEnabled, reloadCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { cn } from "@/lib/utils";
 import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
-import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
-import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
+import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface SettingsGroupProps {
@@ -341,16 +327,6 @@ const CHECKIN_NUMBER_FIELDS = {
 
 type CheckinNumberKey = keyof typeof CHECKIN_NUMBER_FIELDS;
 
-/** 轮换数字参数。 */
-const ROTATE_NUMBER_FIELDS = {
-  check_interval_minutes: { label: "检查间隔", min: 1, max: 1440 },
-  cooldown_minutes: { label: "切换冷却", min: 1, max: 1440 },
-  min_gap_hours: { label: "到期差异阈值", min: 0, max: 720 },
-  min_urgency_hours: { label: "到期紧迫阈值", min: 0, max: 720 },
-  min_remaining_credits: { label: "最小剩余积分", min: 0 },
-} as const satisfies Record<string, NumberFieldSpec>;
-
-type RotateNumberKey = keyof typeof ROTATE_NUMBER_FIELDS;
 
 /** 自动签到配置 + 一键签到 + 日志（含自动旅行行）。 */
 function AutoCheckinCard() {
@@ -869,339 +845,6 @@ function AutoTravelRow() {
   );
 }
 
-/** 自动轮换配置（CodeBuddy CLI）+ 手动检查 + 日志。 */
-function AutoRotateCard() {
-  const [cfg, setCfg] = useState<AutoRotateConfig | null>(null);
-  const [status, setStatus] = useState<RotateStatus | null>(null);
-  /** 显示草稿的同步镜像：事件回调与异步回读都要读最新值，state 只负责渲染。 */
-  const draftRef = useRef<AutoRotateConfig | null>(null);
-  /** 最近一次落盘的配置：即时落盘以它为提交基准。 */
-  const savedRef = useRef<AutoRotateConfig | null>(null);
-  /** 待提交编辑：同一次交互里的连续触发合并为一份最新快照。 */
-  const pendingRef = useRef<SaveCommit<AutoRotateConfig> | null>(null);
-  /** 提交链：串行发送，避免先发的那份（不含后一次编辑）后到达覆盖新值。 */
-  const chainRef = useRef<Promise<void>>(Promise.resolve());
-  /** 数字输入框草稿文本：只覆盖正在编辑的字段，失焦提交后清空。 */
-  const [numDraft, setNumDraft] = useState<Partial<Record<RotateNumberKey, string>>>({});
-  /** 手风琴展开的面板：参数区 / 轮换日志，默认全部收起；开关行与操作行常驻。 */
-  const [openSections, setOpenSections] = useState<string[]>([]);
-  const logsOpen = openSections.includes("logs");
-  const [logs, setLogs] = useState<RotateLog[] | null>(null);
-  const [logsError, setLogsError] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    void loadConfig();
-  }, []);
-
-  // 日志懒加载：展开时才请求，每次展开重新拉取；收起态无可见列表，不请求。
-  useEffect(() => {
-    if (!logsOpen) return;
-    let cancelled = false;
-    void loadLogs(() => cancelled);
-    return () => {
-      cancelled = true;
-    };
-  }, [logsOpen]);
-
-  async function loadConfig() {
-    try {
-      const [c, s] = await Promise.all([api.getAutoRotateConfig(), api.getRotateStatus()]);
-      savedRef.current = c;
-      updateCfg(c);
-      setStatus(s);
-    } catch (e) {
-      toast.error("自动轮换配置加载失败", { description: api.asError(e) });
-    }
-  }
-
-  async function loadLogs(isCancelled?: () => boolean) {
-    setLogsError("");
-    try {
-      const res = await api.getRotateLogs();
-      if (!isCancelled?.()) setLogs(res.logs);
-    } catch (e) {
-      if (isCancelled?.()) return;
-      setLogs(null);
-      setLogsError(api.asError(e));
-    }
-  }
-
-  /** 更新显示草稿（state 供渲染，ref 供事件回调与异步回读读最新值）。 */
-  function updateCfg(next: AutoRotateConfig) {
-    draftRef.current = next;
-    setCfg(next);
-  }
-
-  /** 即时落盘：编辑先合并成一份最新快照，再串行提交（失败回滚到已确认配置）。 */
-  function enqueueRotateSave(
-    edits: Partial<AutoRotateConfig>,
-    success?: SaveCommit<AutoRotateConfig>["success"],
-  ) {
-    if (!savedRef.current) return;
-    const pending = pendingRef.current;
-    pendingRef.current = { edits: { ...pending?.edits, ...edits }, success: success ?? pending?.success };
-    chainRef.current = chainRef.current.then(flushRotateSave);
-  }
-
-  async function flushRotateSave() {
-    const commit = pendingRef.current;
-    pendingRef.current = null;
-    const saved = savedRef.current;
-    if (!commit || !saved) return;
-    try {
-      const next = await api.saveAutoRotateConfig({ ...saved, ...commit.edits });
-      savedRef.current = next;
-      // 回读值只在没有更新编辑排队时才覆盖显示，避免顶掉刚做出的改动。
-      if (!pendingRef.current) updateCfg(next);
-      if (commit.success) {
-        toast.success(commit.success.title, { description: commit.success.description });
-      }
-    } catch (e) {
-      updateCfg(saved);
-      toast.error("自动轮换设置保存失败", { description: api.asError(e) });
-    }
-  }
-
-  /** 主开关：拨动即落盘，失败回滚到上一份已确认配置。 */
-  function onToggleEnabled(enabled: boolean) {
-    const current = draftRef.current;
-    if (!current) return;
-    updateCfg({ ...current, enabled });
-    enqueueRotateSave({ enabled }, { title: enabled ? "自动轮换已开启" : "自动轮换已关闭" });
-  }
-
-  /** 数字参数：失焦 / 回车提交；空值回退原值，越界收敛，与落盘值相同则不发请求。 */
-  function onNumberCommit(key: RotateNumberKey, raw: string) {
-    const current = draftRef.current;
-    const saved = savedRef.current;
-    if (!current || !saved) return;
-    const field = ROTATE_NUMBER_FIELDS[key];
-    const value = resolveNumberInput(raw, field);
-    clearNumDraft(key);
-    const next = { ...current };
-    next[key] = value ?? saved[key];
-    updateCfg(next);
-    if (value === null) {
-      toast.error(numberInputHint(field));
-      return;
-    }
-    if (value === saved[key]) return;
-    const edits: Partial<AutoRotateConfig> = {};
-    edits[key] = value;
-    enqueueRotateSave(edits, { title: `${field.label}已保存` });
-  }
-
-  /** 数字输入框：输入期间只改本地草稿文本，失焦 / 回车才提交。 */
-  function onNumberChange(key: RotateNumberKey, text: string) {
-    setNumDraft((prev) => ({ ...prev, [key]: text }));
-  }
-
-  function clearNumDraft(key: RotateNumberKey) {
-    setNumDraft((prev) => {
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
-  }
-
-  async function runNow() {
-    setBusy(true);
-    try {
-      const res = await api.runRotate();
-      // webui 没有事件通道：手动检查的推迟提示只能从返回值里取（桌面端由
-      // `rotate-deferred` 事件统一弹出，避免同一件事弹两次）。
-      if (api.isWebui() && res.notify?.body) {
-        toast.warning("自动轮换已推迟", { description: res.notify.body, duration: 10_000 });
-      }
-      const text =
-        res.status === "switched"
-          ? `已切换到 ${res.to ?? "目标账号"}`
-          : res.status === "disabled"
-            ? "自动轮换未启用（请在下方开启后重试）"
-            : (res.reason ?? `检查完成：${res.status}`);
-      if (res.status === "error") toast.error(text);
-      else toast.success(text);
-      void loadConfig();
-      if (logsOpen) void loadLogs();
-    } catch (e) {
-      toast.error("轮换检查失败", { description: api.asError(e) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function actionLabel(action: string): { text: string; tone: "success" | "warning" | "error" } {
-    switch (action) {
-      case "switched":
-        return { text: "已切换", tone: "success" };
-      case "skipped":
-        return { text: "未切换", tone: "warning" };
-      case "disabled":
-        return { text: "未启用", tone: "warning" };
-      case "error":
-        return { text: "出错", tone: "error" };
-      default:
-        return { text: action, tone: "warning" };
-    }
-  }
-
-  return (
-    <SettingsGroup
-      id="settings-auto-rotate"
-      title="CodeBuddy CLI 自动轮换"
-    >
-      <CardContent className="space-y-0 p-0">
-        {status && (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border/60 bg-muted/25 px-4 py-3 text-xs text-muted-foreground sm:px-5">
-            <span>
-              当前 CLI 账号：
-              <b className="text-foreground">{status.activeAccountName ?? "未配置"}</b>
-            </span>
-            {status.lastCheckAt && <span>上次检查 {formatTime(status.lastCheckAt)}</span>}
-            {status.lastSwitchAt && <span>上次切换 {formatTime(status.lastSwitchAt)}</span>}
-            {!status.cliConfigured && (
-              <span className="text-destructive">未接入 CodeBuddy CLI（请先到账号页安装 helper）</span>
-            )}
-          </div>
-        )}
-
-        <Accordion type="multiple" value={openSections} onValueChange={setOpenSections}>
-        {cfg ? (
-          <>
-            <AccordionSettingsRow
-              value="params"
-              label="启用自动轮换"
-              description="开启后按设定的间隔自动检查并切换 CodeBuddy CLI 账号"
-              actions={
-                <>
-                  <DemoAction>
-                    <Switch
-                      aria-label="启用自动轮换"
-                      checked={cfg.enabled}
-                      onCheckedChange={onToggleEnabled}
-                    />
-                  </DemoAction>
-                  <DemoAction>
-                    <Button size="sm" variant="outline" onClick={runNow} disabled={busy}>
-                      {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}立即检查一次
-                    </Button>
-                  </DemoAction>
-                </>
-              }
-            >
-              <div className={INSET_PANEL}>
-                <NumberSettingRow
-                  className={PANEL_ROW}
-                  id="ar-interval"
-                  spec={ROTATE_NUMBER_FIELDS.check_interval_minutes}
-                  description="分钟"
-                  value={numDraft.check_interval_minutes ?? String(cfg.check_interval_minutes)}
-                  onChange={(text) => onNumberChange("check_interval_minutes", text)}
-                  onCommit={(raw) => onNumberCommit("check_interval_minutes", raw)}
-                />
-                <NumberSettingRow
-                  className={PANEL_ROW}
-                  id="ar-cooldown"
-                  spec={ROTATE_NUMBER_FIELDS.cooldown_minutes}
-                  description="分钟"
-                  value={numDraft.cooldown_minutes ?? String(cfg.cooldown_minutes)}
-                  onChange={(text) => onNumberChange("cooldown_minutes", text)}
-                  onCommit={(raw) => onNumberCommit("cooldown_minutes", raw)}
-                />
-                <NumberSettingRow
-                  className={PANEL_ROW}
-                  id="ar-gap"
-                  spec={ROTATE_NUMBER_FIELDS.min_gap_hours}
-                  description="小时"
-                  value={numDraft.min_gap_hours ?? String(cfg.min_gap_hours)}
-                  onChange={(text) => onNumberChange("min_gap_hours", text)}
-                  onCommit={(raw) => onNumberCommit("min_gap_hours", raw)}
-                />
-                <NumberSettingRow
-                  className={PANEL_ROW}
-                  id="ar-urgency"
-                  spec={ROTATE_NUMBER_FIELDS.min_urgency_hours}
-                  description="小时"
-                  value={numDraft.min_urgency_hours ?? String(cfg.min_urgency_hours)}
-                  onChange={(text) => onNumberChange("min_urgency_hours", text)}
-                  onCommit={(raw) => onNumberCommit("min_urgency_hours", raw)}
-                />
-                <NumberSettingRow
-                  className={cn(PANEL_ROW, "border-b-0")}
-                  id="ar-min"
-                  spec={ROTATE_NUMBER_FIELDS.min_remaining_credits}
-                  description="低于此值时不切换"
-                  value={numDraft.min_remaining_credits ?? String(cfg.min_remaining_credits)}
-                  onChange={(text) => onNumberChange("min_remaining_credits", text)}
-                  onCommit={(raw) => onNumberCommit("min_remaining_credits", raw)}
-                />
-                <p className="pt-1 text-[13px] leading-5 text-muted-foreground">
-                  切换时机：目标账号剩余到期时间少于「紧迫阈值」且比当前账号早超过「差异阈值」，且目标剩余积分不低于「最小剩余积分」。检测到有 CodeBuddy CLI 会话在运行时，本次轮换会跳过并在当日最多提示 5 次；重启 CLI 后新账号才会生效。
-                </p>
-              </div>
-            </AccordionSettingsRow>
-          </>
-        ) : (
-          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
-        )}
-
-        <AccordionSettingsRow
-          value="logs"
-          label="轮换日志"
-          description="保留最近 200 条；本机明文保存，可能含账号昵称。"
-          divider={false}
-        >
-          <div className={INSET_PANEL}>
-            {logsError ? (
-              <p className="py-2 text-xs text-destructive">{logsError}</p>
-            ) : !logs ? (
-              <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
-            ) : logs.length === 0 ? (
-              <p className="py-2 text-xs text-muted-foreground">暂无轮换记录</p>
-            ) : (
-              <div className="max-h-64 overflow-y-auto pr-1">
-                {logs.map((l, i) => {
-                  const tone = actionLabel(l.action);
-                  return (
-                    <div
-                      key={i}
-                      className="flex items-center justify-between border-b border-border/50 py-2 text-xs last:border-b-0"
-                    >
-                      <div className="min-w-0 flex-1 truncate">
-                        {l.action === "switched" && l.from && l.to && (
-                          <span className="font-medium">
-                            {l.from.name ?? l.from.id} → {l.to.name ?? l.to.id}
-                          </span>
-                        )}
-                        {l.reason && <span className="text-muted-foreground">（{l.reason}）</span>}
-                      </div>
-                      <div className="ml-2 flex shrink-0 items-center gap-2">
-                        <span
-                          className={
-                            tone.tone === "error"
-                              ? "text-destructive"
-                              : tone.tone === "success"
-                                ? "text-emerald-600"
-                                : "text-amber-600"
-                          }
-                        >
-                          {tone.text}
-                        </span>
-                        <span className="text-muted-foreground">{formatTime(l.ts)}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </AccordionSettingsRow>
-        </Accordion>
-      </CardContent>
-    </SettingsGroup>
-  );
-}
 
 /** 权限检测卡片：确认本 App 是否有权写入 WorkBuddy 认证文件（探针与展示路径同档位）。 */
 function PermissionCheckCard() {
@@ -1288,190 +931,6 @@ function useAuthFile(): string | undefined {
   return useAccountsStore((s) => s.status?.authFile);
 }
 
-/** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
-function UpdateCard() {
-  const version = useAccountsStore((s) => s.status?.version);
-  // 阶段与进度来自 Rust 更新服务（托盘同源）：下载完成时按钮换成「重启以完成升级」。
-  const snapshot = useUpdateState();
-  const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [installOpen, setInstallOpen] = useState(false);
-  const [restarting, setRestarting] = useState(false);
-  const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
-  const [proxyUrl, setProxyUrl] = useState("");
-  const [proxySaving, setProxySaving] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    void api
-      .getGithubConfig()
-      .then((config) => {
-        if (cancelled) return;
-        setGithubConfig(config);
-        setProxyUrl(config.proxy ?? "");
-      })
-      .catch((e) => {
-        if (!cancelled) toast.error("更新配置加载失败", { description: api.asError(e) });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  async function check() {
-    setChecking(true);
-    try {
-      const r = await api.checkUpdate(proxyUrl, true);
-      setInfo(r);
-      if (!r.ok) {
-        toast.error("检查更新失败", { description: r.message || r.error });
-      }
-    } catch (e) {
-      toast.error("检查更新失败", { description: api.asError(e) });
-    } finally {
-      setChecking(false);
-    }
-  }
-
-  /** 安装已下载的更新包并重启（下载完成后的主动作，与托盘菜单同一入口）。 */
-  async function restartNow() {
-    setRestarting(true);
-    try {
-      await api.updateRestart();
-    } catch (e) {
-      setRestarting(false);
-      toast.error("重启失败", { description: api.asError(e) });
-    }
-  }
-
-  async function saveProxy() {
-    const value = proxyUrl.trim();
-    if (value) {
-      try {
-        const parsed = new URL(value);
-        if (!parsed.hostname || !["http:", "https:"].includes(parsed.protocol)) {
-          throw new Error("unsupported proxy protocol");
-        }
-      } catch {
-        toast.error("代理地址格式不正确，请填写 HTTP/HTTPS 地址，例如 http://127.0.0.1:7897");
-        return;
-      }
-    }
-
-    setProxySaving(true);
-    try {
-      const saved = await api.saveGithubConfig({ ...githubConfig, proxy: value });
-      setGithubConfig(saved);
-      setProxyUrl(saved.proxy ?? "");
-      toast.success(value ? "更新代理已保存" : "已关闭更新代理");
-    } catch (e) {
-      toast.error("保存代理失败", { description: api.asError(e) });
-    } finally {
-      setProxySaving(false);
-    }
-  }
-
-  return (
-    <SettingsGroup
-      id="settings-updates"
-      title="自动更新"
-    >
-      <CardContent className="space-y-0 p-0">
-        <div className="border-b border-border/60 px-4 py-3 text-sm sm:px-5">
-          当前版本：<span className="font-mono">v{version || "?"}</span>
-        </div>
-
-        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border/60 bg-muted/25 px-4 py-3 text-sm sm:px-5">
-          <div className="min-w-0 flex-1">
-            <div className="font-medium">公开更新源</div>
-            <div className="truncate text-xs text-muted-foreground">{GITHUB_REPOSITORY_URL}</div>
-          </div>
-          <DemoAction><Button
-            variant="ghost"
-            size="icon"
-            title="打开 GitHub Release"
-            onClick={() => void openReleaseUrl(GITHUB_RELEASE_URL)}
-          >
-            <ExternalLink />
-          </Button></DemoAction>
-        </div>
-
-        <SettingsFieldRow
-          label="更新代理地址"
-          description="仅用于 GitHub 更新检查和安装包下载；留空表示关闭显式代理。"
-          htmlFor="update-proxy"
-          className="bg-muted/25"
-          operational
-        >
-          <Input
-            id="update-proxy"
-            className="w-full sm:w-80"
-            value={proxyUrl}
-            onChange={(event) => setProxyUrl(event.target.value)}
-            placeholder="例如 http://127.0.0.1:7897"
-            spellCheck={false}
-            autoComplete="off"
-          />
-        </SettingsFieldRow>
-
-        <div className="flex flex-wrap gap-2 border-b border-border/60 bg-muted/25 px-4 py-3 sm:px-5">
-          <DemoAction><Button size="sm" variant="outline" onClick={() => void saveProxy()} disabled={proxySaving}>
-            {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
-            保存代理
-          </Button></DemoAction>
-        </div>
-
-        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
-          <DemoAction><Button size="sm" variant="outline" onClick={check} disabled={checking}>
-            {checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            检查更新
-          </Button></DemoAction>
-        </div>
-
-        {info?.ok && (
-          <Alert variant="default" className={cn("!w-auto mx-4 my-4 sm:mx-5", info.hasUpdate && "border-primary/35 bg-primary/[0.06]")}>
-            {info.hasUpdate && <ArrowUpCircle className="text-primary" />}
-            <AlertDescription className="space-y-2">
-              <AlertTitle className={cn(info.hasUpdate && "text-primary")}>{info.hasUpdate ? "发现新版本" : "更新检查完成"}</AlertTitle>
-              <div className="text-sm">
-                {info.hasUpdate
-                  ? `发现新版本 v${info.latest}（当前 v${info.current}）`
-                  : `已是最新版本 v${info.current}`}
-                {info.releaseName && <span className="text-muted-foreground"> · {info.releaseName}</span>}
-              </div>
-              {info.hasUpdate && (
-                <DemoAction>
-                  {snapshot.phase === "readyToRestart" ? (
-                    <Button size="sm" onClick={() => void restartNow()} disabled={restarting}>
-                      {restarting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-                      {restarting ? "正在重启…" : "重启以完成升级"}
-                    </Button>
-                  ) : (
-                    <Button size="sm" onClick={() => setInstallOpen(true)}>
-                      <ArrowUpCircle />
-                      立即升级
-                    </Button>
-                  )}
-                </DemoAction>
-              )}
-              {info.releaseUrl && (
-                <DemoAction><Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0"
-                  onClick={() => void openReleaseUrl(info.releaseUrl)}
-                >
-                  打开 GitHub Release
-                </Button></DemoAction>
-              )}
-            </AlertDescription>
-          </Alert>
-        )}
-        <UpdateInstallDialog open={installOpen} onOpenChange={setInstallOpen} />
-      </CardContent>
-    </SettingsGroup>
-  );
-}
 
 /** 开机自启（仅桌面端渲染）：开关直接反映系统自启注册状态，切换立即生效。 */
 function StartupCard() {
@@ -1537,56 +996,6 @@ function StartupCard() {
   );
 }
 
-/** 桌面版 Agent Companion：状态以宿主后端的持久化结果为准。 */
-function CompanionCard() {
-  const { enabled, busy, error } = useCompanionEnabled();
-
-  async function onToggle(next: boolean) {
-    try {
-      const confirmed = await changeCompanionEnabled(next);
-      toast.success(confirmed ? "已启用 Agent Companion 悬浮窗" : "已关闭 Agent Companion 悬浮窗");
-    } catch (cause) {
-      toast.error("悬浮窗设置失败", { description: api.asError(cause) });
-    }
-  }
-
-  async function openSettings() {
-    try {
-      await api.openCompanionSettings();
-    } catch (error) {
-      toast.error("打开悬浮窗设置失败", { description: api.asError(error) });
-    }
-  }
-
-  return (
-    <SettingsGroup id="settings-companion" title="Agent Companion">
-      <CardContent className="space-y-0 p-0">
-        <SettingsFieldRow
-          className="border-b-0"
-          label="启用会话悬浮窗"
-          description="启用后显示悬浮栏；开机静默启动时也会显示，可从托盘临时隐藏"
-          htmlFor="companion-enabled"
-        >
-          <div className="flex items-center gap-2">
-            {error && enabled === null ? (
-              <Button size="sm" variant="outline" onClick={() => void reloadCompanionEnabled()}>重试</Button>
-            ) : null}
-            {enabled ? (
-              <Button size="sm" variant="outline" onClick={() => void openSettings()}>悬浮窗设置</Button>
-            ) : null}
-            <Switch
-              id="companion-enabled"
-              checked={enabled ?? false}
-              disabled={busy || enabled === null}
-              onCheckedChange={(value) => void onToggle(value)}
-              aria-label="启用会话悬浮窗"
-            />
-          </div>
-        </SettingsFieldRow>
-      </CardContent>
-    </SettingsGroup>
-  );
-}
 
 /** 外观：主题选择（持久化到 localStorage）。 */
 const NOTIFICATION_LEVEL_LABEL: Record<AppNotification["level"], string> = {
@@ -1804,7 +1213,6 @@ function ErrorLogCard() {
 
 function AppearanceCard() {
   const [theme, setTheme] = useState<ThemePreference>(getThemePreference);
-  const sessionsNavEnabled = useSessionsNavEnabled();
 
   function onThemeChange(value: string) {
     if (value !== "system" && value !== "light" && value !== "dark") return;
@@ -1819,6 +1227,7 @@ function AppearanceCard() {
     >
       <CardContent className="space-y-0 p-0">
         <SettingsFieldRow
+          className="border-b-0"
           label="主题"
           description="选择浅色、深色，或跟随系统外观自动切换"
           htmlFor="appearance-theme"
@@ -1834,19 +1243,6 @@ function AppearanceCard() {
             </SelectContent>
           </Select>
         </SettingsFieldRow>
-        <SettingsFieldRow
-          className="border-b-0"
-          label="显示关联会话菜单"
-          description="关闭后左侧导航不再显示「关联会话」入口，会话数据与关联关系不受影响"
-          htmlFor="appearance-sessions-nav"
-        >
-          <Switch
-            id="appearance-sessions-nav"
-            checked={sessionsNavEnabled}
-            onCheckedChange={(on) => setSessionsNavEnabled(on)}
-            aria-label="显示关联会话菜单"
-          />
-        </SettingsFieldRow>
       </CardContent>
     </SettingsGroup>
   );
@@ -1856,8 +1252,7 @@ function AppearanceCard() {
  * 支持工具：控制各客户端入口是否在界面上出现。
  *
  * 关闭只隐藏入口（账号卡片按钮、页顶状态徽标）并跳过该端的状态轮询，
- * 不动账号库、不影响其它工具，重新打开即恢复。JetBrains 端默认关闭
- * （新增端先灰度），打开后才出现对应入口。
+ * 不动账号库、不影响其它工具，重新打开即恢复。
  */
 function SupportedToolsCard() {
   const enabled = useSupportedTools();
@@ -1867,9 +1262,6 @@ function SupportedToolsCard() {
     workbuddy: (size) => (variant === "ai" ? <WorkBuddyAiMark size={size} /> : <WorkBuddyMark size={size} />),
     codebuddyIde: (size) =>
       variantUsesIntlCodebuddyIde(variant) ? <CodeBuddyAiIdeMark size={size} /> : <CodeBuddyCnIdeMark size={size} />,
-    codebuddyCli: (size) => <CodeBuddyMark size={size} />,
-    vscodeExt: (size) => <VscodeExtMark size={size} />,
-    jetbrains: (size) => <JetbrainsMark size={size} />,
   };
 
   return (
@@ -2092,14 +1484,14 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：演示模式不渲染自动签到；Agent Companion 只在桌面正式版显示。 */
+/** 设置页：演示模式不渲染自动签到。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {api.isDemoMode() ? "限额监听、权限检测与自动更新配置。" : "自动签到、限额监听、权限检测与自动更新配置。"}
+          {api.isDemoMode() ? "限额监听与权限检测配置。" : "自动签到、限额监听与权限检测配置。"}
         </p>
       </header>
 
@@ -2108,13 +1500,10 @@ export default function SettingsPage() {
         <SupportedToolsCard />
         <PermissionCheckCard />
         {api.isDemoMode() ? null : <AutoCheckinCard />}
-        <AutoRotateCard />
         <RateLimitCard />
-        {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         <NotificationHistoryCard />
         <ErrorLogCard />
-        {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>
     </div>
   );

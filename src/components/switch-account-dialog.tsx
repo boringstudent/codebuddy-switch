@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useState } from "react";
-import { CircleAlert, ExternalLink, Loader2 } from "lucide-react";
+import { ExternalLink, Loader2 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,8 +15,6 @@ import {
 } from "@/components/ui/dialog";
 import { DialogAutoHeight } from "@/components/ui/dialog-auto-height";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-sync-section";
 import { SessionTreeList } from "@/components/session-tree";
 import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
@@ -24,8 +22,6 @@ import { accountVariant, variantAppName } from "@/lib/variant";
 import type {
   AccountMeta,
   Session,
-  SessionLinkPreviewGroup,
-  SessionSyncSelection,
   TemporaryFileInfo,
 } from "@/lib/types";
 
@@ -38,23 +34,11 @@ interface Props {
   onDone?: () => void;
 }
 
-/** 设计稿的 tab 样式：下划线指示 + 可选计数徽标。 */
-const TAB_TRIGGER_CLASS =
-  "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
-
-/** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
-function tabCount(count: number) {
-  return count > 0 ? (
-    <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
-  ) : null;
-}
-
 /**
  * 会话列表区最小高度：加载态、空态与列表共用同一下沿。
  *
  * 弹窗垂直居中，内容高度一变弹窗就上下撑开；
  * 打开时先渲染加载态、会话数据到达后换成列表，两端高度差越大跳得越明显。
- * 与「关联会话」tab 的下沿取同一数值，两个 tab 打开时的高度表现保持一致。
  */
 const LIST_MIN_H = "min-h-[min(7.5rem,26vh)]";
 
@@ -88,13 +72,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [error, setError] = useState("");
   const [currentUid, setCurrentUid] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
-  /** 会话同步：勾选结果（默认值来自后端 defaultChecked）与预览组（结果反馈回显用）。 */
-  const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
-  const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
-  /** 当前 tab：默认关联会话；该 tab 不可用时回落到复制会话。 */
-  const [tab, setTab] = useState<"links" | "copy">("links");
-  /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
-  const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
 
   const variant = accountVariant(account);
   const accountId = account?.id;
@@ -130,10 +107,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setError("");
     setSessions([]);
     setCurrentUid(null);
-    setSyncSelections([]);
-    setSyncGroups([]);
-    setLinksMeta(null);
-    setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
       .then((res) => {
@@ -185,13 +158,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setProgress("正在切换账号…");
     setError("");
     const requestedCopy = selected.size > 0;
-    const requestedSync = syncSelections.length > 0;
     try {
       const res = await api.switchAccount({
         accountId: account.id,
         copySessionIds: requestedCopy ? [...selected] : undefined,
-        // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
-        syncSelections: requestedSync ? syncSelections : undefined,
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -202,13 +172,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (copiedCount > 0) parts.push(`已复制 ${copiedCount} 个会话`);
       if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个之前复制过的会话`);
       if (copyErrors.length > 0) parts.push(`会话复制失败 ${copyErrors.length} 个`);
-      const syncReport = res.sessionSync;
-      const syncedItems = syncReport?.synced ?? [];
-      const skippedItems = syncReport?.skipped ?? [];
-      const syncErrors = syncReport?.errors ?? [];
-      if (syncedItems.length > 0) parts.push(`已同步 ${syncedItems.length} 个会话`);
-      if (skippedItems.length > 0) parts.push(`跳过 ${skippedItems.length} 个会话`);
-      if (syncErrors.length > 0) parts.push(`会话同步失败 ${syncErrors.length} 个`);
       if (res.backup) parts.push(`备份: ${res.backup}`);
       // 成功清理：临时备份已回收，不再展示可还原路径；待清理项单独提示，不写进成功文案。
       toast.success(`已切换至「${nickname}」`, {
@@ -231,33 +194,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           description: "没有收到复制结果：当前版本可能不支持复制会话；账号已切换，但会话没有复制。",
         });
       }
-      // 同步结果：成功、跳过、失败与恢复信息都要能看到，不能只显示成功数。
-      const groupLabel = (groupId: string) =>
-        syncGroups.find((group) => group.groupId === groupId)?.title || groupId;
-      // 失败与跳过合并成一条提示：两者可能同时出现，不能只报其中一类。
-      const syncIssues = [
-        ...syncErrors.map(
-          (item) => `${item.groupId ? groupLabel(item.groupId) : "全部会话"}：${item.error}`,
-        ),
-        // 预览过期/前置条件变化一律跳过并给出原因，绝不显示成已同步。
-        ...skippedItems.map((item) => `${groupLabel(item.groupId)}：${item.message}`),
-      ];
-      if (syncIssues.length > 0) {
-        if (syncErrors.length > 0) {
-          toast.error("部分会话没有同步（失败或已跳过）", { description: syncIssues.join("；") });
-        } else {
-          toast.warning("有会话没有同步（已跳过）", { description: syncIssues.join("；") });
-        }
-      } else if (requestedSync && !syncReport) {
-        toast.warning("会话同步未执行", {
-          description: "没有收到同步结果：当前版本可能不支持同步会话，或本次切换没有重启应用。",
-        });
-      }
-      if (syncReport?.needsRecovery) {
-        toast.error("有会话同步没有完成", {
-          description: "已保留操作记录与备份，下次切换会先恢复；恢复完成前不会再改动目标账号的内容。",
-        });
-      }
       // 未完成的会话写入：可重试项只提示，阻断项由后端直接返回错误。
       const recoveryIssues = res.sessionRecovery?.needsRecovery ?? [];
       if (recoveryIssues.length > 0) {
@@ -268,7 +204,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       // 临时备份残留：待清理说明重试入口；待恢复说明必须保留材料并给出下一步。
       const temporaryFiles = dedupeTemporaryFiles([
         ...(copyReport?.temporaryFiles ?? []),
-        ...(syncReport?.temporaryFiles ?? []),
         ...(res.sessionRecovery?.temporaryFiles ?? []),
       ]);
       const pendingFiles = temporaryFiles.filter((item) => item.state === "cleanupPending");
@@ -277,11 +212,6 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       const pendingCleanupReasons: string[] = [];
       if (temporaryFiles.length === 0) {
         for (const item of copyReport?.copied ?? []) {
-          if (item.cleanupState === "pending") {
-            pendingCleanupReasons.push(item.cleanupError ?? "临时文件待清理");
-          }
-        }
-        for (const item of syncedItems) {
           if (item.cleanupState === "pending") {
             pendingCleanupReasons.push(item.cleanupError ?? "临时文件待清理");
           }
@@ -358,28 +288,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   }, [error, open, variant]);
 
   const copyCount = selected.size;
-  const syncCount = syncSelections.length;
-  /** 覆盖项数量：底部摘要据此提示风险。 */
-  const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
-  const linksAvailable = linksMeta?.available ?? true;
   const summaryMain =
-    copyCount > 0 && syncCount > 0
-      ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
-      : copyCount > 0
-        ? `将复制 ${copyCount} 个会话`
-        : syncCount > 0
-          ? `将同步 ${syncCount} 个关联会话`
-          : "本次仅切换账号";
-  const summarySub =
-    overwriteCount > 0
-      ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
-      : copyCount === 0 && syncCount === 0
-        ? "未选择复制或同步会话"
-        : copyCount === 0
-          ? "未选择复制会话"
-          : syncCount === 0
-            ? "未选择同步会话"
-            : null;
+    copyCount > 0
+      ? `将复制 ${copyCount} 个会话`
+      : "本次仅切换账号";
+  const summarySub = copyCount === 0 ? "未选择复制会话" : null;
   const needsPermission = error.includes("无权限");
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
@@ -392,12 +305,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           : "未检测到当前登录账号，无法列出会话"
         : "把当前账号勾选的会话复制给目标账号（复制后归属目标账号）；已经复制过的不会重复复制";
 
-  // 关联 tab 不可用（国际版能力判定不通过）时回落到复制会话，避免停在空 tab。
-  useEffect(() => {
-    if (!linksAvailable && tab === "links") setTab("copy");
-  }, [linksAvailable, tab]);
-
-  // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
+  // 「复制会话」内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
     <>
       {loadingSessions ? (
@@ -508,67 +416,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               </AlertDescription>
             </Alert>
           )}
-          {linksMeta?.error && (
-            <Alert variant="destructive" className="min-w-0 shrink-0">
-              <CircleAlert />
-              <AlertTitle>无法检查会话</AlertTitle>
-              <AlertDescription className="min-w-0 break-all">{linksMeta.error}</AlertDescription>
-            </Alert>
-          )}
-          {linksMeta?.storeStatus === "unavailable" && (
-            <Alert variant="warning" className="min-w-0 shrink-0">
-              <CircleAlert />
-              <AlertTitle>同步记录不可用</AlertTitle>
-              <AlertDescription className="min-w-0 break-all">
-                {`${linksMeta.storeError || "原因未知"}；本次不会同步任何会话，请处理后重试。`}
-              </AlertDescription>
-            </Alert>
-          )}
-
-          {linksAvailable ? (
-            <Tabs
-              value={tab}
-              onValueChange={(value) => setTab(value as "links" | "copy")}
-              className="flex min-h-0 flex-col gap-3 overflow-hidden"
-            >
-              <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
-                <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
-                  关联会话
-                  {tabCount(linksMeta?.groupCount ?? 0)}
-                </TabsTrigger>
-                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
-                  复制会话
-                  {tabCount(copyCount)}
-                </TabsTrigger>
-              </TabsList>
-              {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
-              <TabsContent
-                value="links"
-                forceMount
-                className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
-              >
-                <SessionSyncSection
-                  open={open}
-                  account={account}
-                  disabled={busy}
-                  onChange={(state) => {
-                    setSyncSelections(state.selections);
-                    setSyncGroups(state.groups);
-                  }}
-                  onMetaChange={setLinksMeta}
-                />
-              </TabsContent>
-              <TabsContent
-                value="copy"
-                forceMount
-                className="min-h-0 space-y-2 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
-              >
-                {copyTabContent}
-              </TabsContent>
-            </Tabs>
-          ) : (
-            <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
-          )}
+          <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
         </div>
 
         <DialogFooter className="shrink-0 sm:justify-between">

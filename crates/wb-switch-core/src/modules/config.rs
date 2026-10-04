@@ -16,6 +16,7 @@ use crate::modules::variant::WbVariant;
 
 // 以下三个常量是「国内版」档位的取值来源（档位取值统一见 modules/variant.rs）；
 // 新增档位差异不要再新增同类常量。
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const WORKBUDDY_API_ENDPOINT: &str = "https://www.codebuddy.cn";
 pub const WORKBUDDY_API_PREFIX: &str = "/v2/plugin";
 pub const WORKBUDDY_PLATFORM: &str = "workbuddy";

@@ -1,11 +1,9 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
-mod companion;
 #[cfg(target_os = "macos")]
 mod instance_lock;
 #[cfg(desktop)]
 mod tray;
-mod update_service;
 
 use std::time::Duration;
 use tauri::Emitter;
@@ -17,47 +15,10 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
-/// 轮换推迟提示：桌面端先向前端推 `rotate-deferred`（应用内提示，窗口开着就能看到），
-/// 再尽力投递系统通知（应用在托盘/后台时可见）。
-///
-/// 应用内提示不依赖系统通知权限：插件在开发态会把通知登记到「终端」名下，且投递失败
-/// 无法观测（`show()` 恒返回 Ok），所以两者都发、以前者为准。
-/// 其它形态由 core 的日志与 `notify` 返回字段承载，宿主不投递。
-pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json::Value) {
-    #[cfg(desktop)]
-    {
-        if let Some(notify) = result.get("notify") {
-            let _ = app.emit("rotate-deferred", notify.clone());
-            tray::notify_rotate_deferred(app, notify);
-        }
-    }
-    #[cfg(not(desktop))]
-    {
-        let _ = (app, result);
-    }
-}
-
-/// 广播「CodeBuddy CLI 认证状态可能已变」，让前端立即重读。
-///
-/// 保活刷新会先批量改写账号库里的 token、再异步同步回 `settings.json`；这个窗口里
-/// 状态接口会短暂读到「账号库已换新、settings 未跟上」。刷新前后各广播一次，
-/// 前端就能把旧判断及时收敛，而不是等下一次页面重挂载。
-pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
-    #[cfg(desktop)]
-    {
-        let _ = app.emit("codebuddy-cli-updated", ());
-    }
-    #[cfg(not(desktop))]
-    {
-        let _ = app;
-    }
-}
-
 /// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
-/// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
+/// 签到时间段时固定 30 分钟）；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
-    let rotate_app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -95,42 +56,15 @@ fn spawn_background_loops(app: tauri::AppHandle) {
 
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
-        let mut last_rotate_at: i64 = 0;
         loop {
-            // 自动轮换（CodeBuddy CLI）：按配置间隔执行
-            let rotate_cfg = modules::config::load_auto_rotate_config();
-            if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = rotate_cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = modules::config::now_ms();
-                if now - last_rotate_at >= interval_minutes * 60_000 {
-                    last_rotate_at = now;
-                    let result = modules::rotate::run_rotate_cycle().await;
-                    deliver_rotate_notify(&rotate_app, &result);
-                }
-            }
             let today = modules::checkin::date_str(None);
             if today != last_keepalive_day {
                 last_keepalive_day = today;
-                // 保活会批量改写 `access_token` 并同步回 settings.json，期间前端若拉到
-                // 状态会读到「账号库已换新、settings 未跟上」的中间态。刷新前后各广播
-                // 一次：先让前端把已显示的旧判断标记为「同步中」，刷新完再让它重读，
-                // 避免误判的告警滞留在页面上。
-                notify_codebuddy_cli_updated(&rotate_app);
                 let _ = modules::refresh::run_keepalive_cycle().await;
-                notify_codebuddy_cli_updated(&rotate_app);
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
-
-    // 统一更新服务：首次 15 秒后检查一次，之后每 30 分钟（未带 force，走 core 的
-    // 6 小时缓存）。检查由 Rust 常驻，替代前端 30 分钟轮询：轻量模式 / 主窗口关闭时
-    // 同样在跑，托盘菜单随时反映最新阶段。
-    update_service::spawn_periodic_check(app.clone());
 
     // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
     // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
@@ -165,14 +99,8 @@ pub fn run() {
 
     builder = builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init());
-
-    #[cfg(desktop)]
-    if !is_screenshot_demo() {
-        builder = builder.plugin(agent_studio_desktop::init(companion::config()));
-    }
 
     #[cfg(desktop)]
     {
@@ -210,27 +138,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::get_accounts,
-            commands::get_codebuddy_cli_status,
-            commands::install_codebuddy_cli_helper,
-            commands::switch_codebuddy_cli_account,
             commands::get_codebuddy_cn_ide_status,
             commands::switch_codebuddy_cn_ide_account,
             commands::detect_codebuddy_cn_ide_account,
             commands::list_codebuddy_ide_sessions,
             commands::codebuddy_ide_session_links_preview,
-            commands::get_vscode_ext_status,
-            commands::switch_vscode_ext_account,
-            commands::detect_vscode_ext_account,
-            commands::list_vscode_sessions,
-            commands::vscode_session_links_preview,
             commands::get_codebuddy_ide_status,
             commands::switch_codebuddy_ide_account,
             commands::list_codebuddy_intl_ide_sessions,
             commands::codebuddy_intl_ide_session_links_preview,
             commands::detect_codebuddy_ide_account,
-            commands::get_jetbrains_status,
-            commands::switch_jetbrains_account,
-            commands::detect_jetbrains_account,
             commands::delete_account,
             commands::update_account_display,
             commands::oauth_start,
@@ -248,17 +165,6 @@ pub fn run() {
             commands::session_links_preview,
             commands::session_links_preview_cross,
             commands::session_sync_cross,
-            commands::list_session_groups,
-            commands::get_session_group,
-            commands::preview_session_group_pair,
-            commands::sync_session_group_pair,
-            commands::sync_session_group_unify,
-            commands::sync_session_group_safe_batch,
-            commands::add_session_group_member,
-            commands::copy_linked_sessions,
-            commands::vscode_restart_precheck,
-            commands::unlink_session_group_member,
-            commands::delete_session_group,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,
@@ -281,17 +187,6 @@ pub fn run() {
             commands::get_auto_travel_config,
             commands::save_auto_travel_config,
             commands::refresh_account_token,
-            commands::get_auto_rotate_config,
-            commands::save_auto_rotate_config,
-            commands::rotate_status,
-            commands::run_rotate,
-            commands::get_rotate_logs,
-            commands::get_github_config,
-            commands::save_github_config,
-            commands::check_update,
-            commands::update_state,
-            commands::update_download,
-            commands::update_restart,
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
@@ -301,9 +196,6 @@ pub fn run() {
             commands::log_error,
             commands::get_error_log_path,
             commands::reveal_error_log,
-            companion::get_companion_enabled,
-            companion::set_companion_enabled,
-            companion::open_companion_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

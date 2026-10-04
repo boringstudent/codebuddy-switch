@@ -12,7 +12,7 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update, variant::WbVariant,
+    account, auth_file, checkin, config, process, travel, variant::WbVariant,
 };
 
 fn default_port() -> u16 {
@@ -20,7 +20,7 @@ fn default_port() -> u16 {
 }
 
 /// 后台任务：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
-/// 签到时间段时固定 30 分钟）；自动轮换按配置间隔执行；
+/// 签到时间段时固定 30 分钟）；
 /// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
 fn spawn_background_loops() {
     tokio::spawn(async move {
@@ -31,26 +31,6 @@ fn spawn_background_loops() {
         loop {
             tokio::time::sleep(checkin::next_cycle_delay()).await;
             let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
-        }
-    });
-
-    tokio::spawn(async move {
-        let mut last_cycle_at: i64 = 0;
-        loop {
-            let cfg = config::load_auto_rotate_config();
-            if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = config::now_ms();
-                if now - last_cycle_at >= interval_minutes * 60_000 {
-                    last_cycle_at = now;
-                    let _ = rotate::run_rotate_cycle().await;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
 
@@ -110,7 +90,7 @@ fn print_status(variant: WbVariant) {
         })
     });
     let running = process::is_workbuddy_running(variant);
-    println!("workbuddy-switch v{}", update::APP_VERSION);
+    println!("workbuddy-switch v{}", config::APP_VERSION);
     println!("WorkBuddy 运行中: {}", if running { "是" } else { "否" });
     match current {
         Some(c) => {
@@ -157,7 +137,7 @@ async fn serve(args: &[String]) {
         }
     };
 
-    println!("workbuddy-switch v{}", update::APP_VERSION);
+    println!("workbuddy-switch v{}", config::APP_VERSION);
     println!("webui: http://{addr}");
     println!("按 Ctrl+C 停止服务。");
 

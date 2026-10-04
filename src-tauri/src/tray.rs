@@ -11,13 +11,11 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
-use wb_switch_core::modules::{checkin, update};
-
-use crate::update_service::{UpdatePhase, UpdateSnapshot};
+use wb_switch_core::modules::checkin;
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
-const DEFAULT_TOOLTIP: &str = "workbuddy-switch";
+const DEFAULT_TOOLTIP: &str = "codeBuddy";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。
@@ -58,12 +56,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
             "open-main-window" => show_main_window(app),
             "open-github" => open_github(app),
             "checkin-all" => start_checkin_all(app),
-            "check-update" => start_update_check(app),
-            "update-now" => start_update_download(app),
-            "update-restart" => start_update_restart(app),
             "lightweight-mode" => toggle_lightweight(app),
-            "companion-toggle" => crate::companion::toggle_rail(app),
-            "companion-settings" => crate::companion::open_settings_from_tray(app),
             "quit-app" => app.exit(0),
             _ => {}
         })
@@ -366,12 +359,9 @@ fn exit_lightweight<R: Runtime>(app: &AppHandle<R>) {
 }
 
 fn open_github<R: Runtime>(app: &AppHandle<R>) {
-    let url = format!(
-        "https://github.com/{}/{}",
-        update::GITHUB_OWNER,
-        update::GITHUB_REPO
-    );
-    let _ = app.opener().open_url(url, None::<&str>);
+    let _ = app
+        .opener()
+        .open_url("https://github.com/changexbc/workbuddy-switch", None::<&str>);
 }
 
 struct CheckinBusyGuard<R: Runtime> {
@@ -416,71 +406,13 @@ fn start_checkin_all<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
-/// 托盘「检查更新」：用户主动触发，force=true 绕过 core 的 6 小时缓存。
-///
-/// 菜单回调和「一键签到」同在主线程，异步检查必须 spawn（见 `start_checkin_all`）。
-fn start_update_check<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = crate::update_service::check(&app, None, true).await;
-    });
-}
-
-/// 托盘「升级到 vX.Y.Z」/「更新失败，点击重试」：启动后台下载。
-///
-/// 互斥与演示模式短路都在更新服务内（下载是长任务，托盘不持有它的生命周期）。
-fn start_update_download<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
-    let _ = crate::update_service::start_download(app);
-}
-
-/// 托盘「重启以完成升级」：安装已下载的包并重启。
-///
-/// 安装会解压整包 / 替换应用（macOS 未授权时弹系统授权框），必须离开主线程执行。
-fn start_update_restart<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = crate::update_service::restart(&app).await;
-    });
-}
-
 fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("workbuddy-switch")
+        .title("codeBuddy")
         .body(body)
         .show();
-}
-
-/// 投递 core 组装好的自动轮换推迟提示（`rotate::run_rotate_cycle` 返回体里的 `notify`）。
-///
-/// 走系统通知而不是托盘 tooltip：轮换是后台行为，用户此时多半没看着窗口。
-/// 标题与正文都取自 core（文案唯一构造点在 `rotate`），宿主不自造措辞；
-/// 无头 server 不投递，只保留日志与返回字段。
-pub fn notify_rotate_deferred<R: Runtime>(app: &AppHandle<R>, notify: &Value) {
-    let title = notify
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("workbuddy-switch");
-    let Some(body) = notify.get("body").and_then(Value::as_str) else {
-        return;
-    };
-    if body.is_empty() {
-        return;
-    }
-    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 /// 是否应弹签到完成通知。
@@ -519,22 +451,7 @@ fn set_tray_tooltip<R: Runtime>(app: &AppHandle<R>, text: &str) {
     }
 }
 
-/// 更新服务写入 tooltip（下载进度）。
-///
-/// 先 bump generation：任何迟到的签到 tooltip 恢复计时器都会因代际不符而放弃，
-/// 不会把下载进度覆盖回默认文案。
-pub(crate) fn set_update_tooltip<R: Runtime>(app: &AppHandle<R>, text: &str) {
-    bump_tooltip_generation();
-    set_tray_tooltip(app, text);
-}
-
-/// 更新流程结束（完成 / 失败）后复位 tooltip。
-pub(crate) fn reset_tray_tooltip<R: Runtime>(app: &AppHandle<R>) {
-    bump_tooltip_generation();
-    set_tray_tooltip(app, DEFAULT_TOOLTIP);
-}
-
-/// 重建托盘菜单（更新服务在阶段切换 / 下载跨 10% 时调用）。
+/// 重建托盘菜单（签到忙碌状态切换时调用）。
 ///
 /// 注意：不要在指针进入 / 点击回调里重建——菜单正在展示时 `set_menu` 会让它闪掉。
 pub(crate) fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
@@ -543,76 +460,6 @@ pub(crate) fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
     };
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_menu(Some(menu));
-    }
-}
-
-/// 托盘更新入口的三种动作（菜单项 id 即对外契约）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum UpdateMenuAction {
-    /// 检查更新。
-    Check,
-    /// 下载 / 重试下载。
-    Download,
-    /// 安装并重启。
-    Restart,
-}
-
-impl UpdateMenuAction {
-    fn id(self) -> &'static str {
-        match self {
-            Self::Check => "check-update",
-            Self::Download => "update-now",
-            Self::Restart => "update-restart",
-        }
-    }
-}
-
-/// 更新菜单项的阶段映射：`(动作, 文案, 是否可点)`。
-///
-/// 菜单与前端弹窗读同一份快照，因此同一时刻两处显示的是同一阶段。
-/// `Error` 按是否已知目标版本区分两种重试文案：已知版本 → 重试下载；未知 → 重试检查。
-fn update_menu_spec(snapshot: &UpdateSnapshot) -> (UpdateMenuAction, String, bool) {
-    match snapshot.phase {
-        UpdatePhase::Idle | UpdatePhase::UpToDate => {
-            (UpdateMenuAction::Check, "检查更新".to_string(), true)
-        }
-        UpdatePhase::Checking => (UpdateMenuAction::Check, "正在检查…".to_string(), false),
-        UpdatePhase::Available => (
-            UpdateMenuAction::Download,
-            match snapshot.latest.as_deref() {
-                Some(latest) => format!("升级到 v{latest}"),
-                None => "升级到新版本".to_string(),
-            },
-            true,
-        ),
-        UpdatePhase::Downloading => (
-            UpdateMenuAction::Download,
-            match snapshot.percent {
-                Some(percent) => format!("正在下载更新 {percent}%"),
-                None => "正在下载更新…".to_string(),
-            },
-            false,
-        ),
-        UpdatePhase::ReadyToRestart => (
-            UpdateMenuAction::Restart,
-            "重启以完成升级".to_string(),
-            true,
-        ),
-        UpdatePhase::Error => {
-            if snapshot.latest.is_some() {
-                (
-                    UpdateMenuAction::Download,
-                    "更新失败，点击重试".to_string(),
-                    true,
-                )
-            } else {
-                (
-                    UpdateMenuAction::Check,
-                    "检查更新失败，点击重试".to_string(),
-                    true,
-                )
-            }
-        }
     }
 }
 
@@ -636,37 +483,12 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
         checkin_enabled,
         None::<&str>,
     )?;
-    let (update_action, update_label, update_enabled) =
-        update_menu_spec(&crate::update_service::snapshot());
-    let update_item = MenuItem::with_id(
-        app,
-        update_action.id(),
-        update_label,
-        update_enabled,
-        None::<&str>,
-    )?;
     let lightweight_item = CheckMenuItem::with_id(
         app,
         "lightweight-mode",
         "轻量模式",
         true,
         LIGHTWEIGHT_MODE.load(Ordering::Acquire),
-        None::<&str>,
-    )?;
-    let companion_enabled =
-        !crate::is_screenshot_demo() && agent_studio_desktop::is_enabled(app.app_handle());
-    let companion_toggle = MenuItem::with_id(
-        app,
-        "companion-toggle",
-        "显示 / 隐藏悬浮窗",
-        companion_enabled,
-        None::<&str>,
-    )?;
-    let companion_settings = MenuItem::with_id(
-        app,
-        "companion-settings",
-        "悬浮窗设置",
-        companion_enabled,
         None::<&str>,
     )?;
     let quit_item = MenuItem::with_id(app, "quit-app", "退出应用", true, None::<&str>)?;
@@ -676,12 +498,7 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
         .item(&github_item)
         .item(&checkin_item)
         .separator()
-        .item(&update_item)
-        .separator()
         .item(&lightweight_item)
-        .separator()
-        .item(&companion_toggle)
-        .item(&companion_settings)
         .separator()
         .item(&quit_item)
         .build()
@@ -903,9 +720,13 @@ fn format_checkin_tooltip(value: &Value) -> String {
 mod tests {
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
+        should_keep_tray_alive, should_wake_main_window, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
+    #[cfg(target_os = "macos")]
+    use super::tray_icon;
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
     use serde_json::json;
 
     #[test]
@@ -1215,91 +1036,6 @@ mod tests {
         assert_eq!(
             format_checkin_tooltip(&payload),
             "签到完成：成功 1，已签 0，失败 0"
-        );
-    }
-
-    /// 托盘更新入口的阶段映射（文案见 design §6，菜单与前端弹窗共用同一快照）。
-    #[test]
-    fn update_menu_spec_maps_each_phase_to_its_entry() {
-        use super::{update_menu_spec, UpdateMenuAction, UpdatePhase, UpdateSnapshot};
-
-        let snapshot =
-            |phase: UpdatePhase, latest: Option<&str>, percent: Option<u8>| UpdateSnapshot {
-                phase,
-                latest: latest.map(str::to_string),
-                percent,
-                message: None,
-                checked_at: None,
-            };
-
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Idle, None, None)),
-            (UpdateMenuAction::Check, "检查更新".to_string(), true)
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::UpToDate, None, None)),
-            (UpdateMenuAction::Check, "检查更新".to_string(), true)
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Checking, None, None)),
-            (UpdateMenuAction::Check, "正在检查…".to_string(), false),
-            "检查中不可重复点击"
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Available, Some("0.1.48"), None)),
-            (
-                UpdateMenuAction::Download,
-                "升级到 v0.1.48".to_string(),
-                true
-            )
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(
-                UpdatePhase::Downloading,
-                Some("0.1.48"),
-                Some(42)
-            )),
-            (
-                UpdateMenuAction::Download,
-                "正在下载更新 42%".to_string(),
-                false
-            )
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Downloading, Some("0.1.48"), None)),
-            (
-                UpdateMenuAction::Download,
-                "正在下载更新…".to_string(),
-                false
-            ),
-            "总量未知时只显示进行中，不显示假百分比"
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::ReadyToRestart, Some("0.1.48"), None)),
-            (
-                UpdateMenuAction::Restart,
-                "重启以完成升级".to_string(),
-                true
-            ),
-            "重启时机由用户决定，不自动重启"
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Error, Some("0.1.48"), None)),
-            (
-                UpdateMenuAction::Download,
-                "更新失败，点击重试".to_string(),
-                true
-            ),
-            "已知目标版本 → 重试的是下载"
-        );
-        assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Error, None, None)),
-            (
-                UpdateMenuAction::Check,
-                "检查更新失败，点击重试".to_string(),
-                true
-            ),
-            "未知版本 → 重试的是检查"
         );
     }
 }

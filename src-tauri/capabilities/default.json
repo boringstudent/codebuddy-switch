@@ -7,7 +7,6 @@
     "core:default",
     "core:window:allow-start-dragging",
     "opener:default",
-    "updater:default",
     "notification:default",
     "dialog:default",
     "dialog:allow-save"

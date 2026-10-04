@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyMark } from "@/components/product-marks";
+import { CodeBuddyCnIdeMark, WorkBuddyMark } from "@/components/product-marks";
 import type { ToolId } from "@/lib/supported-tools";
 import { cn } from "@/lib/utils";
 import { accountIdentity, displayName } from "@/lib/account-display";
@@ -186,20 +186,6 @@ function travelChip(status: TravelStatus | undefined) {
   }
 }
 
-/** VS Code 目标 tooltip：区分「未装 VS Code / 未装扩展 / 可切换」三态。 */
-function vscodeExtTooltip(installed?: boolean, extensionInstalled?: boolean): string {
-  if (!installed) return "未检测到 VS Code";
-  if (!extensionInstalled) return "未检测到 VS Code CodeBuddy 插件";
-  return "切换 VS Code CodeBuddy 插件账号（可选复制会话；可自动关闭并重开）";
-}
-
-/** JetBrains 目标 tooltip：区分「未装 IDE / 未装插件 / 可切换」三态。 */
-function jetbrainsTooltip(installed?: boolean, pluginInstalled?: boolean): string {
-  if (!installed) return "未检测到 JetBrains IDE";
-  if (!pluginInstalled) return "未检测到 JetBrains IDE CodeBuddy 插件";
-  return "切换 JetBrains IDE（IDEA / PyCharm）CodeBuddy 插件账号（可自动关闭并重开）";
-}
-
 /** 倒计时：`2h14m 后恢复`；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
 function formatRateLimitRemaining(resetAt: number, now: number): string {
   const remainingMs = resetAt - now;
@@ -279,43 +265,12 @@ interface Props {
   creditUpdatedAt?: number;
   creditPriority?: boolean;
   workbuddyActive?: boolean;
-  codebuddyCliConfigured?: boolean;
-  codebuddyCliActive?: boolean;
-  /** 任一 CodeBuddy CLI 账号切换正在进行，用于阻止并发切换。 */
-  codebuddyCliBusy?: boolean;
-  onSwitchCodebuddyCli?: (a: AccountMeta) => void;
-  /** 当前卡片是否为正在切换的目标账号。 */
-  codebuddyCliLoading?: boolean;
   /** CodeBuddy CN IDE 是否已安装（可切换）。 */
   codebuddyCnIdeAvailable?: boolean;
   codebuddyCnIdeActive?: boolean;
   codebuddyCnIdeBusy?: boolean;
   codebuddyCnIdeLoading?: boolean;
   onSwitchCodebuddyCnIde?: (a: AccountMeta) => void;
-  /** VS Code 是否已安装（用户数据目录存在）。 */
-  vscodeExtInstalled?: boolean;
-  /** CodeBuddy 扩展是否已安装。 */
-  vscodeExtExtensionInstalled?: boolean;
-  /** VS Code 与扩展均已就绪，可执行切换。 */
-  vscodeExtAvailable?: boolean;
-  vscodeExtActive?: boolean;
-  /** 任一 VS Code 扩展账号切换正在进行，用于阻止并发切换。 */
-  vscodeExtBusy?: boolean;
-  /** 当前卡片是否为正在切换的目标账号。 */
-  vscodeExtLoading?: boolean;
-  onSwitchVscodeExt?: (a: AccountMeta) => void;
-  /** JetBrains 配置目录是否存在（IDEA / PyCharm 任一）。 */
-  jetbrainsInstalled?: boolean;
-  /** 是否任一配置目录安装了 CodeBuddy 插件。 */
-  jetbrainsPluginInstalled?: boolean;
-  /** JetBrains 与插件均已就绪，可执行切换。 */
-  jetbrainsAvailable?: boolean;
-  jetbrainsActive?: boolean;
-  /** 任一 JetBrains 插件账号切换正在进行，用于阻止并发切换。 */
-  jetbrainsBusy?: boolean;
-  /** 当前卡片是否为正在切换的目标账号。 */
-  jetbrainsLoading?: boolean;
-  onSwitchJetbrains?: (a: AccountMeta) => void;
   /**
    * 支持工具开关（设置页「支持工具」）：关闭的端不渲染入口（按钮与激活徽标）。
    * 缺省 / 缺失键视为开启，与 `src/lib/supported-tools.ts` 的默认值一致。
@@ -326,17 +281,11 @@ interface Props {
   compact?: boolean;
 }
 
-function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy" | "codebuddy-cn" | "vscode-ext" | "jetbrains"; compact?: boolean }) {
+function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy-cn"; compact?: boolean }) {
   const title =
     product === "workbuddy"
       ? "WorkBuddy 当前账号"
-      : product === "codebuddy-cn"
-        ? "CodeBuddy IDE 当前账号"
-        : product === "vscode-ext"
-          ? "VS Code CodeBuddy 插件当前账号"
-          : product === "jetbrains"
-            ? "JetBrains IDE CodeBuddy 插件当前账号"
-            : "CodeBuddy CLI 当前账号";
+      : "CodeBuddy IDE 当前账号";
   return (
     <span
       role="status"
@@ -349,14 +298,8 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
     >
       {product === "workbuddy" ? (
         <WorkBuddyMark size={compact ? 18 : 22} />
-      ) : product === "codebuddy-cn" ? (
-        <CodeBuddyCnIdeMark size={compact ? 18 : 22} />
-      ) : product === "vscode-ext" ? (
-        <VscodeExtMark size={compact ? 18 : 22} />
-      ) : product === "jetbrains" ? (
-        <JetbrainsMark size={compact ? 18 : 22} />
       ) : (
-        <CodeBuddyMark size={compact ? 18 : 22} />
+        <CodeBuddyCnIdeMark size={compact ? 18 : 22} />
       )}
       <Check className={compact ? "size-3.5" : "size-4"} strokeWidth={2.25} />
     </span>
@@ -409,7 +352,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
   const [resourcesOpen, setResourcesOpen] = useState(false);
@@ -440,7 +383,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
     })
     .map(({ resource }) => resource);
 
-  const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive, vscodeExtActive, jetbrainsActive].filter(Boolean).length;
+  const activeProductCount = [workbuddyActive, codebuddyCnIdeActive].filter(Boolean).length;
 
   const statusChips = (
     <>
@@ -486,11 +429,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
         className={cn(
           "relative flex items-center border-b border-border",
           compact ? "min-h-[52px] px-3.5 py-1.5" : "min-h-[104px] px-5 py-3",
-          /* 选中态染色，优先级：WorkBuddy / VS Code 插件（品牌绿）> CodeBuddy IDE（淡紫）> CodeBuddy CLI（中性灰）> 默认。
+          /* 选中态染色，优先级：WorkBuddy（品牌绿）> CodeBuddy IDE（淡紫）> 默认。
              多个产品同时选中时取优先级最高者；具体哪几个产品在使用由 header 的标记+勾选角标表达。
              CodeBuddy IDE 的紫是产品专属色：主题里没有对应语义 token，故用 Tailwind 的 violet-500
              （本文件 AVATAR_TONES 已在用同一调色板），透明度与 WorkBuddy 的 /5、/15 保持同一强度。 */
-          workbuddyActive || vscodeExtActive ? "bg-primary/5" : codebuddyCnIdeActive ? "bg-violet-500/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
+          workbuddyActive ? "bg-primary/5" : codebuddyCnIdeActive ? "bg-violet-500/5" : "bg-muted/30",
         )}
       >
         <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -498,39 +441,20 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             className={cn(
               "absolute -right-10 -top-16 rounded-full blur-2xl",
               compact ? "size-20" : "size-24",
-              workbuddyActive || vscodeExtActive ? "bg-primary/15" : codebuddyCnIdeActive ? "bg-violet-500/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
+              workbuddyActive ? "bg-primary/15" : codebuddyCnIdeActive ? "bg-violet-500/15" : "bg-muted/30",
             )}
           />
           {workbuddyActive && (
-            <div className={cn("absolute top-[64%] -translate-y-1/2 opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
+            <div className="absolute right-5 top-[64%] -translate-y-1/2 rotate-[7deg] opacity-[0.075] saturate-50 grayscale-[10%]">
               <WorkBuddyMark size={compact ? 40 : 56} />
-            </div>
-          )}
-          {codebuddyCliActive && (
-            <div className={cn("absolute top-[63%] -translate-y-1/2 opacity-[0.065] saturate-50 grayscale-[18%]", workbuddyActive ? "right-1 -rotate-[8deg]" : "right-5 -rotate-[7deg]")}>
-              <CodeBuddyMark size={compact ? 38 : 54} />
             </div>
           )}
           {codebuddyCnIdeActive && (
             /* 复用 WorkBuddy 的 SVG：两个产品的标记同形；CodeBuddyCnIdeMark 是位图 app 图标，
                放大到水印尺寸会是一块模糊方块。位置与旋转与 WorkBuddy 水印相同 —— 两者同时选中时
                完全重合，因此无需再引入第三套偏移规则。 */
-            <div className={cn("absolute top-[64%] -translate-y-1/2 opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
+            <div className="absolute right-5 top-[64%] -translate-y-1/2 rotate-[7deg] opacity-[0.075] saturate-50 grayscale-[10%]">
               <WorkBuddyMark size={compact ? 40 : 56} />
-            </div>
-          )}
-          {vscodeExtActive && (
-            /* 插件标记是 currentColor 字形（无底块）：显式取品牌绿，与 WorkBuddy 水印同色系；
-               位置规则同 WorkBuddy / IDE，两者同时选中时重合（同样无需第三套偏移规则）。 */
-            <div className={cn("absolute top-[64%] -translate-y-1/2 text-primary opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
-              <VscodeExtMark size={compact ? 40 : 56} />
-            </div>
-          )}
-          {jetbrainsActive && (
-            /* JetBrains 水印与 VS Code 同规则（深色字块 + 品牌色 tint），多产品同时
-               选中时按既有约定与 WorkBuddy 水印重合，不引入新的偏移规则。 */
-            <div className={cn("absolute top-[64%] -translate-y-1/2 text-primary opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
-              <JetbrainsMark size={compact ? 40 : 56} />
             </div>
           )}
         </div>
@@ -624,88 +548,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                   <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
                 </Tooltip>
               ))}
-              {toolEnabled("vscodeExt") && (vscodeExtActive ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
-                      <VscodeExtMark size={15} />
-                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <Check className="size-2.5" strokeWidth={3} />
-                      </span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">VS Code CodeBuddy 插件当前账号</TooltipContent>
-                </Tooltip>
-              ) : demoModeEnabled ? (
-                <DemoAction>
-                  <Button variant="outline" size="icon" className="relative size-7 rounded-lg" aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）">
-                    <VscodeExtMark size={15} />
-                  </Button>
-                </DemoAction>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）" aria-busy={vscodeExtLoading}>
-                      {vscodeExtLoading ? <Loader2 className="size-3.5 animate-spin" /> : <VscodeExtMark size={15} />}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">{vscodeExtTooltip(vscodeExtInstalled, vscodeExtExtensionInstalled)}</TooltipContent>
-                </Tooltip>
-              ))}
-              {toolEnabled("jetbrains") && (jetbrainsActive ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
-                      <JetbrainsMark size={15} />
-                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <Check className="size-2.5" strokeWidth={3} />
-                      </span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">JetBrains IDE CodeBuddy 插件当前账号</TooltipContent>
-                </Tooltip>
-              ) : demoModeEnabled ? (
-                <DemoAction>
-                  <Button variant="outline" size="icon" className="relative size-7 rounded-lg" aria-label="切换到 JetBrains IDE CodeBuddy 插件">
-                    <JetbrainsMark size={15} />
-                  </Button>
-                </DemoAction>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !jetbrainsAvailable || !onSwitchJetbrains || jetbrainsBusy} onClick={() => onSwitchJetbrains?.(account)} aria-label="切换到 JetBrains IDE CodeBuddy 插件" aria-busy={jetbrainsLoading}>
-                      {jetbrainsLoading ? <Loader2 className="size-3.5 animate-spin" /> : <JetbrainsMark size={15} />}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">{jetbrainsTooltip(jetbrainsInstalled, jetbrainsPluginInstalled)}</TooltipContent>
-                </Tooltip>
-              ))}
-              {toolEnabled("codebuddyCli") && (codebuddyCliActive ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
-                      <CodeBuddyMark size={15} />
-                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <Check className="size-2.5" strokeWidth={3} />
-                      </span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">CodeBuddy CLI 当前账号</TooltipContent>
-                </Tooltip>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="size-7 rounded-lg" disabled={featuresDisabled || !codebuddyCliConfigured || !onSwitchCodebuddyCli || codebuddyCliBusy} onClick={() => onSwitchCodebuddyCli?.(account)} aria-label={codebuddyCliLoading ? "正在切换 CodeBuddy CLI 当前账号" : "设为 CodeBuddy CLI 当前账号"} aria-busy={codebuddyCliLoading}>
-                      {codebuddyCliLoading ? <Loader2 className="size-3.5 animate-spin" /> : <CodeBuddyMark size={15} />}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
-                </Tooltip>
-              ))}
             </div>
           </div>
         ) : (
-          <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive || codebuddyCliActive ? "pr-[112px]" : "pr-10")}>
+          <div className="relative z-10 flex w-full min-w-0 items-center gap-3 pr-10">
             <div className={cn("flex size-12 shrink-0 items-center justify-center rounded-full text-base font-semibold ring-4 ring-white/65", avatarClass)}>{name.charAt(0).toUpperCase()}</div>
             <div className="min-w-0 flex-1">
               <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
@@ -804,48 +650,6 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
-            </Tooltip>
-          ))}
-          {toolEnabled("vscodeExt") && (vscodeExtActive ? <ProductCurrentState product="vscode-ext" compact /> : demoModeEnabled ? (
-            <DemoAction>
-              <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）">
-                <VscodeExtMark size={18} /><span>VS Code</span>
-              </Button>
-            </DemoAction>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）" aria-busy={vscodeExtLoading}>
-                  {vscodeExtLoading ? <Loader2 className="size-4 animate-spin" /> : <VscodeExtMark size={18} />}<span>{vscodeExtLoading ? "切换中…" : "VS Code"}</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">{vscodeExtTooltip(vscodeExtInstalled, vscodeExtExtensionInstalled)}</TooltipContent>
-            </Tooltip>
-          ))}
-          {toolEnabled("jetbrains") && (jetbrainsActive ? <ProductCurrentState product="jetbrains" compact /> : demoModeEnabled ? (
-            <DemoAction>
-              <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="切换到 JetBrains IDE CodeBuddy 插件">
-                <JetbrainsMark size={18} /><span>JetBrains</span>
-              </Button>
-            </DemoAction>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !jetbrainsAvailable || !onSwitchJetbrains || jetbrainsBusy} onClick={() => onSwitchJetbrains?.(account)} aria-label="切换到 JetBrains IDE CodeBuddy 插件" aria-busy={jetbrainsLoading}>
-                  {jetbrainsLoading ? <Loader2 className="size-4 animate-spin" /> : <JetbrainsMark size={18} />}<span>{jetbrainsLoading ? "切换中…" : "JetBrains"}</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">{jetbrainsTooltip(jetbrainsInstalled, jetbrainsPluginInstalled)}</TooltipContent>
-            </Tooltip>
-          ))}
-          {toolEnabled("codebuddyCli") && (codebuddyCliActive ? <ProductCurrentState product="codebuddy" compact /> : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !codebuddyCliConfigured || !onSwitchCodebuddyCli || codebuddyCliBusy} onClick={() => onSwitchCodebuddyCli?.(account)} aria-label={codebuddyCliLoading ? "正在切换 CodeBuddy CLI 当前账号" : "设为 CodeBuddy CLI 当前账号"} aria-busy={codebuddyCliLoading}>
-                  {codebuddyCliLoading ? <Loader2 className="size-4 animate-spin" /> : <CodeBuddyMark size={18} />}<span>{codebuddyCliLoading ? "切换中…" : "CLI 当前"}</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
             </Tooltip>
           ))}
         </footer>

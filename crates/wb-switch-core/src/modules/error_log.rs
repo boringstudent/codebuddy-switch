@@ -55,7 +55,7 @@ fn build_entry(kind: &str, message: &str, detail: &str, at_ms: i64) -> Value {
         "kind": normalize_kind(kind),
         "message": message,
         "detail": truncate_detail(detail),
-        "appVersion": crate::modules::update::APP_VERSION,
+        "appVersion": crate::modules::config::APP_VERSION,
         "os": std::env::consts::OS,
     })
 }
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(entry["detail"], json!("堆栈信息"));
         assert_eq!(
             entry["appVersion"],
-            json!(crate::modules::update::APP_VERSION)
+            json!(crate::modules::config::APP_VERSION)
         );
         assert_eq!(entry["os"], json!(std::env::consts::OS));
 

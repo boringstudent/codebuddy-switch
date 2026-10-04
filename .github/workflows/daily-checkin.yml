@@ -1,0 +1,49 @@
+# ============================================================================
+# 每日自动签到（北京时间 02:00）
+#
+# 工作机制：
+#   工作流使用专用访问 key（仓库 Secret）从 EO 边缘函数拉取账号数据，
+#   逐账号执行「临期刷新 → 查状态 → 未签提交」，日志只输出昵称与结果，
+#   不打印任何 token / key。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   EO_ACCOUNTS_URL  EO 边缘函数地址（如 https://xxx.eo-edgefunctions.com）
+#   EO_ACCESS_KEY    与 EO 函数环境变量 ACCESS_KEY 相同的访问 key
+#   QQ               QQ 邮箱授权码（签到完成后向 boring_student@qq.com 自发报告邮件）
+#
+# 时区说明：GitHub Actions 的 cron 使用 UTC。
+#   北京时间 02:00 = UTC 前一天 18:00，即 '0 18 * * *'。
+# ============================================================================
+name: 每日自动签到
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # UTC 18:00 = 北京时间次日 02:00
+  workflow_dispatch: {} # 允许手动触发一次
+
+permissions: {}
+
+concurrency:
+  group: daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    name: 拉取账号并签到
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EO_ACCOUNTS_URL: ${{ secrets.EO_ACCOUNTS_URL }}
+      EO_ACCESS_KEY: ${{ secrets.EO_ACCESS_KEY }}
+      QQ: ${{ secrets.QQ }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 执行每日签到
+        run: node scripts/daily-checkin.mjs

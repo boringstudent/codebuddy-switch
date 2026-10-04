@@ -1,4 +1,0 @@
-[workspace]
-members = ["crates/agent-studio-core", "crates/agent-studio-runtime", "crates/agent-studio-desktop"]
-exclude = ["src-tauri"]
-resolver = "2"

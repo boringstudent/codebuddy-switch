@@ -2,35 +2,24 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
-  Columns3,
-  ExternalLink,
   FileDown,
   FileUp,
   Loader2,
   QrCode,
   RefreshCw,
-  Rows3,
-  Terminal,
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
 import { AccountInfoDialog } from "@/components/account-info-dialog";
-import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
 import { CodebuddyIdeSwitchAccountDialog } from "@/components/codebuddy-ide-switch-account-dialog";
 import { DemoAction } from "@/components/demo-action";
 import {
-  CodeBuddyAiIdeMark,
   CodeBuddyCnIdeMark,
-  CodeBuddyMark,
-  JetbrainsMark,
-  VscodeExtMark,
-  WorkBuddyAiMark,
   WorkBuddyMark,
 } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
@@ -44,15 +33,12 @@ import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
-import { VscodeSwitchAccountDialog } from "@/components/vscode-switch-account-dialog";
 import * as api from "@/lib/api";
 import { useVisibleInterval } from "@/lib/use-visible-interval";
 import {
   accountVariant,
-  normalizeVariant,
   variantAppName,
   variantCodebuddyIdeName,
-  variantDownloadDomain,
   variantLabel,
   variantSupportsCheckin,
   variantSupportsTravel,
@@ -61,7 +47,6 @@ import {
 import { useSupportedTools } from "@/lib/supported-tools";
 import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
 import { displayName } from "@/lib/account-display";
-import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
 /**
@@ -74,15 +59,6 @@ import { useAccountsStore } from "@/stores/accounts";
  */
 const TRAVEL_REFRESH_INTERVAL_MS = 60 * 1000;
 const RATE_LIMIT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-/**
- * CodeBuddy CLI 认证状态的重读间隔。
- *
- * 保活刷新会先批量改写账号库里的 token、再把新 token 同步回
- * `~/.codebuddy/settings.json`。这个窗口里状态判定会短暂认为「认证已脱节」。
- * 后端在刷新前后各广播一次 `codebuddy-cli-updated`（见 lib.rs 保活循环），
- * 这里再挂一个可见时轮询兜底：即使事件因窗口未挂载而错过，横幅也会自行收掉。
- */
-const CLI_STATUS_REFRESH_INTERVAL_MS = 30 * 1000;
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -167,7 +143,6 @@ export default function AccountsPage() {
   const {
     accounts,
     variant,
-    setVariant,
     status,
     loading,
     error,
@@ -212,25 +187,15 @@ export default function AccountsPage() {
    */
   const [rateLimitEnabled, setRateLimitEnabled] = useState<boolean | null>(null);
   /**
-   * 各客户端状态（CLI / CodeBuddy IDE / VS Code / JetBrains）放在 store 里：
+   * CodeBuddy IDE 状态放在 store 里：
    * 账号页每次进入都会重挂载，局部 state 会被重置为 `null`，界面先按「未接入」
    * 渲染、等状态探测回来才改口（issue #84）。store 里则先按上次结果渲染。
    */
-  const { codebuddyCli, codebuddyCnIde, vscodeExt, jetbrains } = clientStatus;
-  const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
+  const { codebuddyCnIde } = clientStatus;
   /** CodeBuddy IDE 切换弹窗目标（null=关闭）；切换与可选会话复制/同步在弹窗内完成（国内版 / 国际版共用）。 */
   const [codebuddyIdeSwitchAccount, setCodebuddyIdeSwitchAccount] = useState<AccountMeta | null>(null);
-  /** VS Code 扩展切换弹窗目标（null=关闭）；切换与可选会话复制在弹窗内完成。 */
-  const [vscodeSwitchAccount, setVscodeSwitchAccount] = useState<AccountMeta | null>(null);
-  /** JetBrains 切换弹窗目标（null=关闭）；切换与目标 IDE 选择在弹窗内完成。 */
-  const [jetbrainsSwitchTarget, setJetbrainsSwitchTarget] = useState<AccountMeta | null>(null);
-  const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
-  /** 接入/升级 CLI helper 确认框 */
-  const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
-  /** 切换 CodeBuddy CLI 确认目标（null=关闭） */
-  const [cliSwitchTarget, setCliSwitchTarget] = useState<AccountMeta | null>(null);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
   /** 当前档位下的账号：列表、计数、签到、积分等一律只作用于当前档位。 */
@@ -257,32 +222,14 @@ export default function AccountsPage() {
       .filter((account) => !excludedCheckinIds.has(account.id))
       .map((account) => account.id);
   }, [visibleAccounts, checkinAvailable, autoCheckinSettled, excludedCheckinIds]);
-  /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
-  const [compact, setCompact] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("wb-switch.compact") !== "0";
-    } catch {
-      return true;
-    }
-  });
+  /** 账号列表固定紧凑模式（卡片更小、同屏更多列）。 */
+  const compact = true;
 
   /**
    * 支持工具开关（设置页）：关闭的端不渲染入口、不轮询状态。
-   * 缺省 = 现有四端开、JetBrains 关（与 `src/lib/supported-tools.ts` 的默认值一致）。
+   * 缺省 = WorkBuddy 与 CodeBuddy IDE 两端开（与 `src/lib/supported-tools.ts` 的默认值一致）。
    */
   const enabledTools = useSupportedTools();
-
-  function toggleCompact() {
-    setCompact((value) => {
-      const next = !value;
-      try {
-        localStorage.setItem("wb-switch.compact", next ? "1" : "0");
-      } catch {
-        /* 存储不可用时静默 */
-      }
-      return next;
-    });
-  }
 
   useEffect(() => {
     void fetchAll();
@@ -307,14 +254,6 @@ export default function AccountsPage() {
     };
   }, []);
 
-  async function refreshCodebuddyCliStatus() {
-    try {
-      setClientStatus({ codebuddyCli: await api.getCodebuddyCliStatus() });
-    } catch {
-      setClientStatus({ codebuddyCli: null });
-    }
-  }
-
   async function refreshCodebuddyCnIdeStatus() {
     try {
       setClientStatus({
@@ -327,38 +266,16 @@ export default function AccountsPage() {
     }
   }
 
-  async function refreshVscodeExtStatus() {
-    try {
-      setClientStatus({ vscodeExt: await api.getVscodeExtStatus() });
-    } catch {
-      setClientStatus({ vscodeExt: null });
-    }
-  }
-
-  async function refreshJetbrainsStatus() {
-    try {
-      setClientStatus({ jetbrains: await api.getJetbrainsStatus() });
-    } catch {
-      setClientStatus({ jetbrains: null });
-    }
-  }
-
   useEffect(() => {
     let cancelled = false;
-    // 支持工具关闭的端：既不探测也不轮询（与入口隐藏保持一致，省掉无谓请求）。
-    if (enabledTools.codebuddyCli) void refreshCodebuddyCliStatus();
 
     /**
-     * 读各端状态（安装 / 运行 / 当前账号）：只读本地状态文件与进程，不碰钥匙串，
+     * 读 IDE 状态（安装 / 运行 / 当前账号）：只读本地状态文件与进程，不碰钥匙串，
      * 因此不必等下面的本机登录探测。
      */
     async function refreshClientStatuses() {
       if (cancelled) return;
       if (enabledTools.codebuddyIde) await refreshCodebuddyCnIdeStatus();
-      if (cancelled) return;
-      if (enabledTools.vscodeExt) await refreshVscodeExtStatus();
-      if (cancelled) return;
-      if (enabledTools.jetbrains) await refreshJetbrainsStatus();
     }
 
     void (async () => {
@@ -377,20 +294,6 @@ export default function AccountsPage() {
             }
           } catch {
             /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
-          }
-        }
-        if (enabledTools.vscodeExt) {
-          try {
-            await api.detectVscodeExtAccount();
-          } catch {
-            /* VS Code 未登录或 Safe Storage 不可用时静默 */
-          }
-        }
-        if (enabledTools.jetbrains) {
-          try {
-            await api.detectJetbrainsAccount();
-          } catch {
-            /* JetBrains 插件未登录时静默 */
           }
         }
       }
@@ -492,11 +395,6 @@ export default function AccountsPage() {
   const loadRateLimitsRef = useRef(loadRateLimits);
   loadRateLimitsRef.current = loadRateLimits;
 
-  // 事件监听与定时器都需要「最新」的刷新函数：直接闭包捕获会在状态更新后仍然
-  // 指向旧引用，导致拉回的仍是挂载时的旧判断。
-  const refreshCodebuddyCliStatusRef = useRef(refreshCodebuddyCliStatus);
-  refreshCodebuddyCliStatusRef.current = refreshCodebuddyCliStatus;
-
   // 兜底轮询：页面可见且距上次扫描 ≥ 5 分钟时拉一次（IDE 日志扫描在后端按同一间隔节流）。
   // 图标何时消失由卡片本地按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
   useVisibleInterval(
@@ -517,31 +415,6 @@ export default function AccountsPage() {
     });
     return () => unlisten?.();
   }, []);
-
-  /**
-   * CLI 认证状态变化（保活刷新前后、切换账号、接入 helper）→ 立即重读。
-   *
-   * 没有这一路时，页面只在挂载时读一次状态：若恰好落在保活刷新的中间态，
-   * 判出来的「认证已脱节」会一直留在页面上，用户点什么都要等下次重挂载。
-   */
-  useEffect(() => {
-    if (api.isWebui()) return;
-    let unlisten: (() => void) | undefined;
-    void listen("codebuddy-cli-updated", () => {
-      void refreshCodebuddyCliStatusRef.current();
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => unlisten?.();
-  }, []);
-
-  // 兜底轮询：事件可能因窗口尚未挂载而错过（例如后台刷新先于页面加载完成），
-  // 仅主窗口可见时执行，保证横幅最终一定会自愈。
-  useVisibleInterval(
-    () => void refreshCodebuddyCliStatusRef.current(),
-    CLI_STATUS_REFRESH_INTERVAL_MS,
-    true,
-  );
 
   // 「限额监听」开关（设置页）：关闭后不再发起扫描；开关状态来自后端配置文件，
   // 设置页改完返回账号页会重新挂载并读到新值。
@@ -707,61 +580,11 @@ export default function AccountsPage() {
     }
   }
 
-  async function onSwitchCodebuddyCli(account: AccountMeta) {
-    if (codebuddyCliSwitchingId !== null) return;
-    setCliSwitchTarget(account);
-  }
-
-  async function confirmSwitchCodebuddyCli() {
-    const account = cliSwitchTarget;
-    if (!account || codebuddyCliSwitchingId !== null) return;
-    setCliSwitchTarget(null);
-    setCodebuddyCliSwitchingId(account.id);
-    const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
-      description: `正在将默认账号设为 ${displayName(account)}`,
-    });
-    try {
-      // 后端一律先关闭正在运行的 CLI 再写状态（`closeRunningCli` 入参已废弃）。
-      const result = await api.switchCodebuddyCliAccount(account.id);
-      await refreshCodebuddyCliStatus();
-      toast.success("CodeBuddy CLI 默认账号已更新", {
-        id: toastId,
-        description: `${displayName(account)}：${result.message || "配置已更新"}`,
-      });
-    } catch (error) {
-      toast.error("CodeBuddy CLI 切换失败", {
-        id: toastId,
-        description: api.asError(error),
-      });
-    } finally {
-      setCodebuddyCliSwitchingId(null);
-    }
-  }
-
   async function onSwitchCodebuddyCnIde(account: AccountMeta) {
     if (codebuddyIdeSwitchAccount !== null) return;
     // 国内版与国际版共用同一弹窗（关联会话 / 复制会话两个 tab），只有数据源与切换接口按档位分流；
     // 弹窗本身承担确认职责（不勾选时行为与一键切换一致），不再另设轻量确认框。
     setCodebuddyIdeSwitchAccount(account);
-  }
-
-  async function onInstallCodebuddyCli() {
-    // 桌面 App（Tauri WebView）不支持 window.confirm，改用 Dialog 确认
-    setInstallConfirmOpen(true);
-  }
-
-  async function confirmInstallCodebuddyCli() {
-    setInstallConfirmOpen(false);
-    setInstallingCodebuddyCli(true);
-    try {
-      const result = await api.installCodebuddyCliHelper();
-      toast.success("CodeBuddy CLI 接入已更新", { description: result.message });
-      await refreshCodebuddyCliStatus();
-    } catch (error) {
-      toast.error("CodeBuddy CLI 接入失败", { description: api.asError(error) });
-    } finally {
-      setInstallingCodebuddyCli(false);
-    }
   }
 
   const current = status?.current;
@@ -791,25 +614,11 @@ export default function AccountsPage() {
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
-  const cliCurrentAccountId = codebuddyCli?.activeAccountId;
-  const cliSwitchAccountLabel = cliSwitchTarget ? displayName(cliSwitchTarget) : "";
   const workbuddyCurrentName = current ? displayName(current) : "未登录";
-  const codebuddyCurrentName = codebuddyCli?.configured
-    ? codebuddyCli.activeAccountName || "未检测到"
-    : "尚未接入";
   const cnIdeCurrentAccountId = codebuddyCnIde?.activeAccountId;
   const cnIdeCurrentName = codebuddyCnIde?.installed
     ? codebuddyCnIde.activeAccountName || "未检测到"
     : "未安装";
-  const vscodeExtCurrentAccountId = vscodeExt?.activeAccountId;
-  const vscodeExtCurrentName = vscodeExt?.installed
-    ? vscodeExt.activeAccountName || "未检测到"
-    : "未接入";
-  const jetbrainsCurrentAccountId = jetbrains?.activeAccountId;
-  const jetbrainsCurrentName = jetbrains?.installed
-    ? jetbrains.activeAccountName || "未检测到"
-    : "未接入";
-  const codebuddyUsesSettingsEnv = codebuddyCli?.authMode === "settings-env";
   return (
     <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
       <header className="mb-6">
@@ -817,18 +626,8 @@ export default function AccountsPage() {
           <div className="min-w-0">
             <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号、积分和签到状态。
+              统一管理 WorkBuddy 与 CodeBuddy IDE 账号、积分和签到状态。
             </p>
-            <Tabs
-              className="mt-4 gap-0"
-              value={variant}
-              onValueChange={(value) => setVariant(normalizeVariant(value))}
-            >
-              <TabsList aria-label="WorkBuddy 档位">
-                <TabsTrigger value="cn">国内版</TabsTrigger>
-                <TabsTrigger value="ai">国际版</TabsTrigger>
-              </TabsList>
-            </Tabs>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
             <div className="flex items-center gap-2.5">
@@ -841,7 +640,7 @@ export default function AccountsPage() {
                       : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
                   }
                 >
-                  {variant === "ai" ? <WorkBuddyAiMark size={28} /> : <WorkBuddyMark size={28} />}
+                  <WorkBuddyMark size={28} />
                 </span>
                 <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
                   {appName}：{status?.running ? "运行中" : "未运行"} · 当前账号：{workbuddyCurrentName}
@@ -857,62 +656,10 @@ export default function AccountsPage() {
                       : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
                   }
                 >
-                  {variantUsesIntlCodebuddyIde(variant) ? (
-                    <CodeBuddyAiIdeMark size={28} />
-                  ) : (
-                    <CodeBuddyCnIdeMark size={28} />
-                  )}
+                  <CodeBuddyCnIdeMark size={28} />
                 </span>
                 <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
                   {variantCodebuddyIdeName(variant)}：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
-                </span>
-              </span>
-            )}
-{enabledTools.vscodeExt && (
-              <span className="group relative inline-flex cursor-default">
-                <span
-                  className={
-                    vscodeExt?.installed && vscodeExt?.extensionInstalled
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
-                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
-                  }
-                >
-                  <VscodeExtMark size={28} />
-                </span>
-                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  VS Code CodeBuddy 插件：{!vscodeExt?.installed ? "未检测到 VS Code" : !vscodeExt.extensionInstalled ? "未安装插件" : vscodeExt.running ? "运行中" : "已接入"} · 当前账号：{vscodeExtCurrentName}
-                </span>
-              </span>
-            )}
-{enabledTools.jetbrains && (
-              <span className="group relative inline-flex cursor-default">
-                <span
-                  className={
-                    jetbrains?.installed && jetbrains?.pluginInstalled
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
-                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
-                  }
-                >
-                  <JetbrainsMark size={28} />
-                </span>
-                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  JetBrains IDE 插件：{!jetbrains?.installed ? "未检测到 JetBrains IDE" : !jetbrains.pluginInstalled ? "未安装插件" : jetbrains.running ? "运行中" : "已接入"} · 当前账号：{jetbrainsCurrentName}
-                </span>
-              </span>
-            )}
-{enabledTools.codebuddyCli && (
-              <span className="group relative inline-flex cursor-default">
-                <span
-                  className={
-                    codebuddyCli?.configured
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
-                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
-                  }
-                >
-                  <CodeBuddyMark size={28} />
-                </span>
-                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  CodeBuddy CLI：{codebuddyCli?.migrationRequired ? "需升级" : codebuddyCli?.configured ? "已接入" : "未接入"} · 当前账号：{codebuddyCurrentName}
                 </span>
               </span>
             )}
@@ -929,9 +676,7 @@ export default function AccountsPage() {
           <div className="min-w-[190px] flex-1">
             <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              {variant === "ai"
-                ? "快速接入国际版账号，或从已有环境恢复"
-                : "快速接入新账号，或从已有环境恢复"}
+              快速接入新账号，或从已有环境恢复
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
@@ -940,8 +685,7 @@ export default function AccountsPage() {
                 className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
                 onClick={() => setOauthOpen(true)}
               >
-                {variant === "ai" ? <ExternalLink /> : <QrCode />}
-                {variant === "ai" ? "OAuth 登录" : "OAuth 扫码添加"}
+                <QrCode />OAuth 扫码添加
               </Button>
             </DemoAction>
           </div>
@@ -967,54 +711,6 @@ export default function AccountsPage() {
         </Alert>
       )}
 
-      {codebuddyCli &&
-        (!codebuddyCli.configured ||
-          (!codebuddyUsesSettingsEnv && !codebuddyCli.helperSupportsAccountIds) ||
-          codebuddyCli.migrationRequired ||
-          codebuddyCli.syncPending ||
-          codebuddyCli.syncInProgress) && (
-        <Alert className="mb-4">
-          <Terminal />
-          <AlertTitle>CodeBuddy CLI 接入</AlertTitle>
-          <AlertDescription>
-            <p>
-              {codebuddyUsesSettingsEnv
-                ? codebuddyCli.environmentOverride
-                  ? "检测到进程环境变量 CODEBUDDY_AUTH_TOKEN。它会覆盖 settings.json；请先从 Windows 用户或系统环境变量中删除它，再重启本应用与 CodeBuddy CLI。"
-                  : codebuddyCli.syncPending
-                    ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                    : codebuddyCli.syncInProgress
-                      ? "保活刷新已更新账号 Token，正在同步到 CodeBuddy CLI 认证配置。稍候会自动完成，无需操作。"
-                      : codebuddyCli.migrationRequired
-                        ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                        : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
-                : codebuddyCli.migrationRequired
-                  ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
-                  : codebuddyCli.configured
-                    ? "当前 helper 仍按旧索引读取账号；升级后将按账号 ID 独立切换，账号增删也不会错位。"
-                    : "WorkBuddy 账号与积分功能可正常使用；如需从这里切换 CodeBuddy CLI 账号，点击下方按钮一键接入。"}
-            </p>
-            {/* 同步进行中是正常的中间态：给状态说明但不逼用户点按钮，
-                否则用户会在刷新未完成时重复触发写入。 */}
-            {!codebuddyCli.syncInProgress && (
-              <DemoAction>
-                <Button
-                  className="mt-2"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void onInstallCodebuddyCli()}
-                  disabled={installingCodebuddyCli}
-                >
-                  {installingCodebuddyCli && <Loader2 className="animate-spin" />}
-                  {codebuddyUsesSettingsEnv
-                    ? codebuddyCli.configured ? "更新 CLI 认证" : "接入 CLI"
-                    : codebuddyCli.configured || codebuddyCli.migrationRequired ? "升级 CLI helper" : "接入 CLI"}
-                </Button>
-              </DemoAction>
-            )}
-          </AlertDescription>
-        </Alert>
-      )}
       <section className="mt-7 min-w-0" aria-labelledby="accounts-list-title">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -1029,20 +725,6 @@ export default function AccountsPage() {
           </div>
           <TooltipProvider delayDuration={400}>
             <div className="ml-auto flex items-center gap-1">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn("size-9 rounded-lg", compact && "bg-accent text-accent-foreground")}
-                    onClick={toggleCompact}
-                    aria-label={compact ? "切换为宽松模式" : "切换为紧凑模式"}
-                  >
-                    {compact ? <Rows3 /> : <Columns3 />}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">{compact ? "切换为宽松模式" : "切换为紧凑模式"}</TooltipContent>
-              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span>
@@ -1072,20 +754,10 @@ export default function AccountsPage() {
           </div>
         ) : visibleAccounts.length === 0 ? (
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-            {variant === "ai" ? (
-              <>
-                <p>暂无国际版账号。</p>
-                <p className="mt-2 text-xs leading-5">
-                  点击上方「OAuth 登录」添加账号；本机已登录的账号也请一并添加，以便随时切回。
-                  切换前请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）。
-                </p>
-              </>
-            ) : (
-              "暂无账号。点击上方「OAuth 扫码添加」接入账号；本机已登录的账号也请一并添加，以便随时切回。"
-            )}
+            暂无账号。点击上方「OAuth 扫码添加」接入账号；本机已登录的账号也请一并添加，以便随时切回。
           </div>
         ) : (
-          <div className={cn("grid min-w-0 gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+          <div className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))] gap-5">
             {/* 不要给这个网格加 items-start：它会覆盖 Grid 默认的 stretch，让同排卡片因内容长度不同而
                 高低参差。卡片内部 article 是 flex-col、内容区是 flex-1，会自动吸收差额、footer 自动贴底对齐。 */}
             {orderedAccounts.map((a) => (
@@ -1107,27 +779,10 @@ export default function AccountsPage() {
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}
                 creditPriority={a.id === priorityAccountId}
                 workbuddyActive={enabledTools.workbuddy && isWorkbuddyCurrent(a, current)}
-                codebuddyCliConfigured={codebuddyCli?.configured && !codebuddyCli.migrationRequired && !codebuddyCli.syncPending && !codebuddyCli.syncInProgress}
-                codebuddyCliActive={enabledTools.codebuddyCli && a.id === cliCurrentAccountId}
-                codebuddyCliBusy={codebuddyCliSwitchingId !== null}
-                onSwitchCodebuddyCli={onSwitchCodebuddyCli}
-                codebuddyCliLoading={codebuddyCliSwitchingId === a.id}
                 codebuddyCnIdeAvailable={Boolean(codebuddyCnIde?.installed)}
                 codebuddyCnIdeActive={enabledTools.codebuddyIde && a.id === cnIdeCurrentAccountId}
                 codebuddyCnIdeBusy={codebuddyIdeSwitchAccount !== null}
                 onSwitchCodebuddyCnIde={onSwitchCodebuddyCnIde}
-                vscodeExtInstalled={Boolean(vscodeExt?.installed)}
-                vscodeExtExtensionInstalled={Boolean(vscodeExt?.extensionInstalled)}
-                vscodeExtAvailable={Boolean(vscodeExt?.installed && vscodeExt?.extensionInstalled)}
-                vscodeExtActive={enabledTools.vscodeExt && a.id === vscodeExtCurrentAccountId}
-                vscodeExtBusy={vscodeSwitchAccount !== null}
-                onSwitchVscodeExt={setVscodeSwitchAccount}
-                jetbrainsInstalled={Boolean(jetbrains?.installed)}
-                jetbrainsPluginInstalled={Boolean(jetbrains?.pluginInstalled)}
-                jetbrainsAvailable={Boolean(jetbrains?.installed && jetbrains?.pluginInstalled)}
-                jetbrainsActive={enabledTools.jetbrains && a.id === jetbrainsCurrentAccountId}
-                jetbrainsBusy={jetbrainsSwitchTarget !== null}
-                onSwitchJetbrains={setJetbrainsSwitchTarget}
                 enabledTools={enabledTools}
                 featuresDisabled={false}
               />
@@ -1157,7 +812,6 @@ export default function AccountsPage() {
         account={switchAccount}
         onDone={() => {
           void fetchAll();
-          void refreshCodebuddyCliStatus();
           void refreshCodebuddyCnIdeStatus();
         }}
       />
@@ -1183,89 +837,6 @@ export default function AccountsPage() {
           void refreshCodebuddyCnIdeStatus();
         }}
       />
-      <VscodeSwitchAccountDialog
-        open={vscodeSwitchAccount !== null}
-        onOpenChange={(o) => {
-          if (!o) setVscodeSwitchAccount(null);
-        }}
-        account={vscodeSwitchAccount}
-        vscodeExtStatus={vscodeExt}
-        onDone={() => {
-          void refreshVscodeExtStatus();
-        }}
-      />
-      <JetbrainsSwitchDialog
-        open={jetbrainsSwitchTarget !== null}
-        onOpenChange={(o) => {
-          if (!o) setJetbrainsSwitchTarget(null);
-        }}
-        account={jetbrainsSwitchTarget}
-        jetbrainsStatus={jetbrains}
-        onDone={() => {
-          void refreshJetbrainsStatus();
-        }}
-      />
-
-      {/* 接入/升级 CLI 认证确认（桌面 App 不支持 window.confirm） */}
-      <Dialog open={installConfirmOpen} onOpenChange={setInstallConfirmOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {codebuddyUsesSettingsEnv
-                ? "更新 CodeBuddy CLI 认证"
-                : codebuddyCli?.configured || codebuddyCli?.migrationRequired
-                  ? "升级 CodeBuddy CLI helper"
-                  : "接入 CodeBuddy CLI"}
-            </DialogTitle>
-            <DialogDescription>
-              {codebuddyUsesSettingsEnv ? (
-                <>
-                  将把当前账号的认证 Token 写入
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy/settings.json</code>
-                  的 <code className="mx-1 rounded bg-muted px-1">env.CODEBUDDY_AUTH_TOKEN</code>。
-                  其他配置会保留；更新只影响后续加载的会话，当前运行会话不会切换。是否继续？
-                </>
-              ) : (
-                <>
-                  {codebuddyCli?.configured || codebuddyCli?.migrationRequired ? "升级" : "接入"}会自动写入
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy-rotate/helper.cjs</code>
-                  并更新
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy/settings.json</code>
-                  的 apiKeyHelper 配置，是否继续？
-                </>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setInstallConfirmOpen(false)}>
-              取消
-            </Button>
-            <Button onClick={() => void confirmInstallCodebuddyCli()}>继续</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* 切换 CodeBuddy CLI 确认（桌面 App 不支持 window.confirm） */}
-      <Dialog open={cliSwitchTarget !== null} onOpenChange={(open) => !open && setCliSwitchTarget(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>切换 CodeBuddy CLI</DialogTitle>
-            <DialogDescription>
-              将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
-              确认后会关闭正在运行的 CodeBuddy CLI 会话，当前会话会中断；重新打开 CLI 后新账号才会生效。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setCliSwitchTarget(null)}>
-              取消
-            </Button>
-            <Button onClick={() => void confirmSwitchCodebuddyCli()}>
-              关闭 CLI 并切换
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       {/* 删除账号确认 */}
       <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
         <DialogContent>
