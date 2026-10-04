@@ -28,10 +28,12 @@ const ACCOUNT_GAP_MS = 1500; // 账号间隔，避免触发网关频控
 // 签到完成后向该地址发送报告邮件（自发自收）；授权码读环境变量 QQ。
 const MAIL_ADDRESS = 'boring_student@qq.com';
 
-const EO_ACCOUNTS_URL = (process.env.EO_ACCOUNTS_URL || '').replace(/\/+$/, '');
+// 兼容不带 https:// 前缀的写法（Secrets 里只填域名时自动补全）。
+const rawEoUrl = (process.env.EO_ACCOUNTS_URL || '').trim();
+const EO_ACCOUNTS_URL = (/^https?:\/\//i.test(rawEoUrl) ? rawEoUrl : `https://${rawEoUrl}`).replace(/\/+$/, '');
 const EO_ACCESS_KEY = process.env.EO_ACCESS_KEY || '';
 
-if (!EO_ACCOUNTS_URL || !EO_ACCESS_KEY) {
+if (!rawEoUrl || !EO_ACCESS_KEY) {
   console.error('缺少环境变量 EO_ACCOUNTS_URL / EO_ACCESS_KEY（请在仓库 Secrets 配置）');
   process.exit(2);
 }
