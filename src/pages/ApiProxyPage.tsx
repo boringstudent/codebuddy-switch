@@ -79,6 +79,7 @@ const SUPPORTED_MODELS = [
   "kimi-k3",
   "kimi-k2.6",
   "kimi-k2.5",
+  "hy3",
   "hy4-preview",
   "hy3-preview",
   "hunyuan-chat",

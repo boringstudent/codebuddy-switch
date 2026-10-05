@@ -64,6 +64,7 @@ pub const SUPPORTED_MODELS: &[&str] = &[
     "kimi-k3",
     "kimi-k2.6",
     "kimi-k2.5",
+    "hy3",
     "hy4-preview",
     "hy3-preview",
     "hunyuan-chat",
@@ -82,7 +83,7 @@ fn model_context_length(model: &str) -> u64 {
         "minimax-m2.7" => 200000,
         "kimi-k3" | "kimi-k2.6" => 256000,
         "kimi-k2.5" => 1_000_000,
-        "hy4-preview" | "hy3-preview" | "hunyuan-chat" | "hunyuan-2.0-thinking" => 256000,
+        "hy3" | "hy4-preview" | "hy3-preview" | "hunyuan-chat" | "hunyuan-2.0-thinking" => 256000,
         _ => 128000,
     }
 }
