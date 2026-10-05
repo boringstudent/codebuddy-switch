@@ -2,6 +2,8 @@
 
 WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切换桌面 App（Tauri），四者均支持国内版 / 国际版，并提供积分到期与 Token 用量监控。
 
+本项目整合了两个开源项目的成果：[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)（账号切换、积分监控与统计、Agent 状态悬浮窗）与 [hailinzhao/antigravity-tools](https://github.com/hailinzhao/antigravity-tools)（批量签到、API Key 代理），并在此基础上合并演进为统一的桌面应用。
+
 <p align="center">
   <img src="public/icon-transparent.png" alt="CodeBuddy 图标" width="128" />
 </p>
@@ -16,7 +18,8 @@ WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切�
 | --- | --- | --- |
 | macOS Apple Silicon（M 系列，arm64） | `CodeBuddy_<版本>_aarch64.dmg` | 打开 DMG，将 `CodeBuddy.app` 拖入「应用程序」 |
 | macOS Intel（x86_64） | `CodeBuddy_<版本>_x86_64.dmg` | 打开 DMG，将 `CodeBuddy.app` 拖入「应用程序」 |
-| Windows x64 | `CodeBuddy_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
+| Windows x64 | `CodeBuddy_<版本>_x64-setup.exe` / `CodeBuddy_<版本>_x64_en-US.msi` | 运行安装程序并按提示完成安装 |
+| Windows x64（便携版） | `CodeBuddy_<版本>_x64-portable.zip` | 解压后直接运行 `CodeBuddy.exe`，无需安装 |
 | Linux x64 | `CodeBuddy_<版本>_amd64.deb` / `CodeBuddy_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
 
 macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
@@ -46,7 +49,6 @@ xattr -rd com.apple.quarantine "/Applications/CodeBuddy.app"
 | 自动轮换 | 后台把积分最紧迫的账号设为 CodeBuddy CLI 后续启动账号；检测到 CLI 会话运行时会跳过 |
 | 自动更新 | 从 GitHub Releases 检查新版本，整包更新经签名校验 |
 | 会话悬浮窗 | 桌面版内置 Agent Companion 悬浮栏，在桌面集中显示 Codex / WorkBuddy / CodeBuddy / Codeg 会话的运行中 / 待确认 / 已完成状态；悬停查看详情，支持跳转时点击回到原会话，托盘可临时隐藏 |
-| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
 ## 支持的工具
 
@@ -121,7 +123,14 @@ CodeBuddy CLI 切换时会先关闭正在运行的 CLI，当前会话会中断�
 
 1. 首次切换报「无权限」时，点「打开系统设置」
 2. 优先在 **App 管理** 里打开 CodeBuddy 开关；若没有，则去 **完全磁盘访问** 把 CodeBuddy 拖进带箭头的框
-3. 授权后重启本应用生效；设置页「权限检测」可随时验证
+3. 授权后重启本应用生效；若仍提示无权限，请重新执行切换操作验证
+
+## 致谢
+
+本项目整合自以下开源项目，感谢原作者的工作：
+
+- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)：WorkBuddy / CodeBuddy 账号切换、积分到期监控、积分统计与 Token 统计、Agent 状态悬浮窗（MIT）
+- [hailinzhao/antigravity-tools](https://github.com/hailinzhao/antigravity-tools)：WorkBuddy / CodeBuddy 批量签到与 API Key 代理
 
 ## 许可
 
