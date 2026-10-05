@@ -3,7 +3,6 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { DemoAction } from "@/components/demo-action";
 import {
   Dialog,
   DialogContent,
@@ -19,7 +18,6 @@ import { cn } from "@/lib/utils";
 import { accountIdentity, displayName } from "@/lib/account-display";
 import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
-import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, TravelStatus } from "@/lib/types";
 
 function formatCredits(value: number): string {
@@ -468,27 +466,21 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
-              {!demoModeEnabled && (
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
-                </DropdownMenuItem>
-              )}
+              <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
+                <RefreshCw />刷新 Token
+              </DropdownMenuItem>
               <DropdownMenuItem disabled={featuresDisabled || !onShowInfo} onSelect={() => onShowInfo?.(account)}>
                 <Info />账号信息
               </DropdownMenuItem>
-              {!demoModeEnabled && onCheckin && todayCheckedIn !== true && (
+              {onCheckin && todayCheckedIn !== true && (
                 <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
                   <CircleCheck />手动签到
                 </DropdownMenuItem>
               )}
-              {!demoModeEnabled && (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
-                    <Trash2 />删除账号
-                  </DropdownMenuItem>
-                </>
-              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
+                <Trash2 />删除账号
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -510,12 +502,6 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                   </TooltipTrigger>
                   <TooltipContent side="top">WorkBuddy 当前账号</TooltipContent>
                 </Tooltip>
-              ) : demoModeEnabled ? (
-                <DemoAction>
-                  <Button variant="outline" size="icon" className="size-7 rounded-lg" aria-label="设为 WorkBuddy 当前账号">
-                    <WorkBuddyMark size={15} />
-                  </Button>
-                </DemoAction>
               ) : (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -626,13 +612,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
 
       {!compact && (
         <footer className="flex flex-wrap items-center gap-2.5 border-t px-5 py-2.5">
-          {toolEnabled("workbuddy") && (workbuddyActive ? <ProductCurrentState product="workbuddy" compact /> : demoModeEnabled ? (
-            <DemoAction>
-              <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="设为 WorkBuddy 当前账号">
-                <WorkBuddyMark size={18} /><span>设为当前</span>
-              </Button>
-            </DemoAction>
-          ) : (
+          {toolEnabled("workbuddy") && (workbuddyActive ? <ProductCurrentState product="workbuddy" compact /> : (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !onSwitch} onClick={() => onSwitch?.(account)} aria-label="设为 WorkBuddy 当前账号">

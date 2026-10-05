@@ -2,7 +2,6 @@ import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import * as api from "@/lib/api";
 import { useAccountsStore } from "@/stores/accounts";
 
 export const WORKBUDDY_STATUS_REFRESH_INTERVAL_MS = 60 * 1000;
@@ -16,11 +15,10 @@ export function useWorkbuddyStatusRefresh() {
   useEffect(() => {
     let disposed = false;
     let documentVisible = document.visibilityState !== "hidden";
-    const webui = api.isWebui();
     // Tauri emits the startup visibility decision before the WebView may have
-    // installed this listener. Keep desktop inactive until isVisible() supplies
+    // installed this listener. Keep inactive until isVisible() supplies
     // the authoritative initial value; later transitions arrive via the event.
-    let mainWindowVisible = webui;
+    let mainWindowVisible = false;
     let windowFocused = document.hasFocus();
 
     function stopTimer() {
@@ -75,7 +73,7 @@ export function useWorkbuddyStatusRefresh() {
     syncActiveState();
 
     let unlisten: (() => void) | undefined;
-    if (!webui) {
+    {
       void (async () => {
         try {
           const fn = await listen<boolean>("main-window-visible", (event) => {

@@ -76,16 +76,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const variant = accountVariant(account);
   const accountId = account?.id;
 
-  // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
+  // 监听后端切换进度（Tauri 事件）
   useEffect(() => {
-    if (api.isWebui()) {
-      const timer = setInterval(() => {
-        void api.switchProgress().then((p) => {
-          if (p.progress) setProgress(p.progress);
-        });
-      }, 600);
-      return () => clearInterval(timer);
-    }
     let unlisten: (() => void) | undefined;
     listen<{ message: string }>("switch-progress", (e) => {
       setProgress(e.payload.message);

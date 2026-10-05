@@ -10,8 +10,8 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session,
     codebuddy_ide_session_sync, config, credit_usage, credits, error_log, export_import, limits,
-    notifications, oauth, process, rate_limit_events, rate_limit_hook, refresh, session, switch,
-    token_stats, travel, variant::WbVariant, vscode_session,
+    notifications, oauth, process, proxy, rate_limit_events, rate_limit_hook, refresh, session,
+    switch, token_stats, travel, variant::WbVariant, vscode_session,
 };
 
 #[derive(Serialize)]
@@ -961,4 +961,166 @@ pub async fn list_notifications() -> Result<Value, String> {
 #[tauri::command]
 pub async fn clear_notifications() -> Result<(), String> {
     notifications::clear()
+}
+
+// ---------------------------------------------------------------------------
+// API 反向代理（本地 OpenAI 兼容中转服务）
+// ---------------------------------------------------------------------------
+
+/// GET /api/proxy/status —— 代理服务运行状态与设置。
+#[tauri::command]
+pub fn get_proxy_status() -> Value {
+    proxy::proxy_server_status()
+}
+
+/// GET /api/proxy/overview —— 代理消耗总览（累计 + 今日 Token/积分/调用数）。
+#[tauri::command]
+pub fn get_proxy_overview() -> Value {
+    proxy::proxy_overview()
+}
+
+/// POST /api/proxy/start —— 启动代理服务（local 绑 127.0.0.1，open 绑 0.0.0.0）。
+#[tauri::command]
+pub async fn start_proxy_server(port: u16, mode: String) -> Result<Value, String> {
+    proxy::start_proxy_server(port, &mode).await
+}
+
+/// POST /api/proxy/stop —— 停止代理服务。
+#[tauri::command]
+pub fn stop_proxy_server() -> Value {
+    proxy::stop_proxy_server()
+}
+
+/// POST /api/proxy/settings —— 保存代理设置（upstream_proxy / auto_start 等）。
+#[tauri::command]
+pub fn save_proxy_settings(settings: Value) -> Value {
+    proxy::save_settings(&settings);
+    proxy::proxy_server_status()
+}
+
+/// GET /api/proxy/upstream-keys —— 上游 Key 池列表。
+#[tauri::command]
+pub fn list_proxy_upstream_keys() -> Value {
+    json!({ "keys": proxy::list_upstream_keys() })
+}
+
+/// GET /api/proxy/importable-accounts —— 可导入为上游 Key 的账号（明文凭据）。
+#[tauri::command]
+pub fn list_proxy_importable_accounts() -> Value {
+    json!({ "accounts": proxy::importable_accounts() })
+}
+
+/// POST /api/proxy/import-accounts —— 把选中账号导入上游 Key 池。
+#[tauri::command]
+pub fn import_proxy_accounts(account_ids: Vec<String>) -> Value {
+    json!({ "imported": proxy::import_accounts_as_keys(&account_ids) })
+}
+
+/// POST /api/proxy/upstream-keys/update —— 更新上游 Key（状态/标签等）。
+#[tauri::command]
+pub fn update_proxy_upstream_key(key_id: String, updates: Value) -> Value {
+    proxy::update_upstream_key(&key_id, &updates);
+    json!({ "ok": true })
+}
+
+/// POST /api/proxy/upstream-keys/delete —— 删除上游 Key。
+#[tauri::command]
+pub fn delete_proxy_upstream_key(key_id: String) -> Value {
+    proxy::delete_upstream_key(&key_id);
+    json!({ "ok": true })
+}
+
+/// POST /api/proxy/upstream-keys/refresh-points —— 批量查询积分并同步状态。
+#[tauri::command]
+pub async fn refresh_proxy_key_points() -> Value {
+    proxy::refresh_all_key_points().await
+}
+
+/// POST /api/proxy/upstream-keys/check-status —— 批量风控检测。
+#[tauri::command]
+pub async fn check_proxy_key_status() -> Value {
+    proxy::check_all_key_status().await
+}
+
+/// GET /api/proxy/sub-keys —— 子 API Key 列表（附可用积分总和）。
+#[tauri::command]
+pub fn list_proxy_sub_keys() -> Value {
+    let keys: Vec<Value> = proxy::list_sub_keys()
+        .into_iter()
+        .map(|mut key| {
+            let allowed: Vec<String> = key
+                .get("allowed_key_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            key["total_points"] = json!(proxy::total_points_for_sub_key(&allowed));
+            key
+        })
+        .collect();
+    json!({ "keys": keys })
+}
+
+/// POST /api/proxy/sub-keys/create —— 创建子 API Key，返回完整记录（含明文 Key）。
+#[tauri::command]
+pub fn create_proxy_sub_key(data: Value) -> Value {
+    let key = json!({
+        "key_id": proxy::new_sub_key_id(),
+        "api_key": proxy::new_sub_api_key(),
+        "label": data.get("label").and_then(Value::as_str).unwrap_or(""),
+        "is_active": true,
+        "allowed_models": data.get("allowed_models").cloned().unwrap_or(json!([])),
+        "allowed_key_ids": data.get("allowed_key_ids").cloned().unwrap_or(json!([])),
+        "max_usage": data.get("max_usage").and_then(Value::as_u64).unwrap_or(0),
+        "max_tokens": data.get("max_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "max_credits": data.get("max_credits").and_then(Value::as_f64).unwrap_or(0.0),
+        "used_count": 0,
+        "rate_limit_rpm": data.get("rate_limit_rpm").and_then(Value::as_u64).unwrap_or(1000),
+        "key_mode": data.get("key_mode").and_then(Value::as_u64).unwrap_or(1),
+        "created_at": proxy::now_iso_string(),
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_tokens": 0,
+        "total_cached_tokens": 0,
+        "total_credits": 0.0,
+    });
+    proxy::add_sub_key(key.clone());
+    json!({ "ok": true, "key": key })
+}
+
+/// POST /api/proxy/sub-keys/update —— 更新子 API Key。
+#[tauri::command]
+pub fn update_proxy_sub_key(key_id: String, updates: Value) -> Value {
+    proxy::update_sub_key(&key_id, &updates);
+    json!({ "ok": true })
+}
+
+/// POST /api/proxy/sub-keys/delete —— 删除子 API Key。
+#[tauri::command]
+pub fn delete_proxy_sub_key(key_id: String) -> Value {
+    proxy::delete_sub_key(&key_id);
+    json!({ "ok": true })
+}
+
+/// GET /api/proxy/logs —— 请求日志（since 之后，最多 limit 条）。
+#[tauri::command]
+pub fn get_proxy_logs(since: Option<f64>, limit: Option<usize>) -> Value {
+    json!({ "logs": proxy::request_logs(since.unwrap_or(0.0), limit.unwrap_or(200).min(1000)) })
+}
+
+/// POST /api/proxy/logs/clear —— 清空请求日志。
+#[tauri::command]
+pub fn clear_proxy_logs() -> Value {
+    proxy::clear_request_logs();
+    json!({ "ok": true })
+}
+
+/// GET /api/proxy/daily-stats —— 某个 Key 的每日统计。
+#[tauri::command]
+pub fn get_proxy_daily_stats(category: String, key_id: String) -> Value {
+    proxy::daily_stats(&category, &key_id)
 }

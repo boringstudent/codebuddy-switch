@@ -7,8 +7,11 @@ description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+# API 反代：OpenAI 兼容接口的 HTTP 服务与流式转发。
+axum = "0.7"
+futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 chrono = "0.4"

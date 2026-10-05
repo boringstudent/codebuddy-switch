@@ -10,12 +10,11 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent, Runtime, WebviewWindowBuilder, Window, WindowEvent,
 };
 use tauri_plugin_notification::NotificationExt;
-use tauri_plugin_opener::OpenerExt;
 use wb_switch_core::modules::checkin;
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
-const DEFAULT_TOOLTIP: &str = "codeBuddy";
+const DEFAULT_TOOLTIP: &str = "CodeBuddy";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。
@@ -54,7 +53,6 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-main-window" => show_main_window(app),
-            "open-github" => open_github(app),
             "checkin-all" => start_checkin_all(app),
             "lightweight-mode" => toggle_lightweight(app),
             "quit-app" => app.exit(0),
@@ -358,13 +356,6 @@ fn exit_lightweight<R: Runtime>(app: &AppHandle<R>) {
     refresh_tray_menu(app);
 }
 
-fn open_github<R: Runtime>(app: &AppHandle<R>) {
-    let _ = app.opener().open_url(
-        "https://github.com/changexbc/workbuddy-switch",
-        None::<&str>,
-    );
-}
-
 struct CheckinBusyGuard<R: Runtime> {
     app: AppHandle<R>,
 }
@@ -377,10 +368,6 @@ impl<R: Runtime> Drop for CheckinBusyGuard<R> {
 }
 
 fn start_checkin_all<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
     if CHECKIN_BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -411,7 +398,7 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("codeBuddy")
+        .title("CodeBuddy")
         .body(body)
         .show();
 }
@@ -466,7 +453,6 @@ pub(crate) fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 
 fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>> {
     let open_item = MenuItem::with_id(app, "open-main-window", "打开主界面", true, None::<&str>)?;
-    let github_item = MenuItem::with_id(app, "open-github", "打开 GitHub", true, None::<&str>)?;
     // 档位区分在 core 判定：无签到活动的档位（国际版）不参与「待签到」集合，
     // 否则这些账号永远不会产生签到日志，托盘会一直显示「可签到」。
     let checked_in = checkin::all_accounts_checked_in_today();
@@ -496,7 +482,6 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
 
     MenuBuilder::new(app)
         .item(&open_item)
-        .item(&github_item)
         .item(&checkin_item)
         .separator()
         .item(&lightweight_item)

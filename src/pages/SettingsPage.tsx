@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ChevronDown,
   CircleCheck,
@@ -7,7 +7,6 @@ import {
 import { toast } from "sonner";
 
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,7 +41,6 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
-import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -94,7 +92,6 @@ interface SettingsFieldRowProps {
   htmlFor?: string;
   children: ReactNode;
   className?: string;
-  operational?: boolean;
 }
 
 function SettingsFieldRow({
@@ -103,7 +100,6 @@ function SettingsFieldRow({
   htmlFor,
   children,
   className,
-  operational = false,
 }: SettingsFieldRowProps) {
   return (
     <SettingsRow className={cn("flex-col items-stretch gap-2 sm:flex-row sm:items-center", className)}>
@@ -120,7 +116,7 @@ function SettingsFieldRow({
         )}
       </div>
       <div className="flex min-w-0 w-full shrink-0 justify-end sm:w-auto">
-        {operational ? <DemoAction className="w-full sm:w-auto">{children as ReactElement}</DemoAction> : children}
+        {children}
       </div>
     </SettingsRow>
   );
@@ -218,7 +214,6 @@ function NumberSettingRow({
       label={spec.label}
       description={description}
       htmlFor={id}
-      operational
     >
       <Input
         id={id}
@@ -600,18 +595,14 @@ function AutoCheckinCard() {
                 description="为允许自动签到的账号核验状态并补签；可在下方按账号关闭"
                 actions={
                   <>
-                    <DemoAction>
-                      <Switch
-                        aria-label="启用自动签到"
-                        checked={cfg.enabled}
-                        onCheckedChange={onToggleEnabled}
-                      />
-                    </DemoAction>
-                    <DemoAction>
-                      <Button size="sm" variant="outline" onClick={checkinAllNow} disabled={busy || saving}>
-                        {busy ? <Loader2 className="animate-spin" /> : <CircleCheck />}全部立即签到
-                      </Button>
-                    </DemoAction>
+                    <Switch
+                      aria-label="启用自动签到"
+                      checked={cfg.enabled}
+                      onCheckedChange={onToggleEnabled}
+                    />
+                    <Button size="sm" variant="outline" onClick={checkinAllNow} disabled={busy || saving}>
+                      {busy ? <Loader2 className="animate-spin" /> : <CircleCheck />}全部立即签到
+                    </Button>
                   </>
                 }
               >
@@ -628,36 +619,30 @@ function AutoCheckinCard() {
                   >
                     <div className="flex min-w-0 w-full flex-col items-end gap-1 sm:w-auto">
                       <div className="flex min-w-0 w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
-                        <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                          <TimePicker
-                            className="min-w-0 flex-1 sm:flex-none"
-                            value={cfg.checkin_start}
-                            hourLabel="签到开始时间（小时）"
-                            minuteLabel="签到开始时间（分钟）"
-                            onChange={(v) => onWindowChange("checkin_start", v)}
-                          />
-                        </DemoAction>
+                        <TimePicker
+                          className="min-w-0 flex-1 sm:flex-none"
+                          value={cfg.checkin_start}
+                          hourLabel="签到开始时间（小时）"
+                          minuteLabel="签到开始时间（分钟）"
+                          onChange={(v) => onWindowChange("checkin_start", v)}
+                        />
                         <span className="shrink-0 text-xs text-muted-foreground">至</span>
-                        <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                          <TimePicker
-                            className="min-w-0 flex-1 sm:flex-none"
-                            value={cfg.checkin_end}
-                            hourLabel="签到结束时间（小时）"
-                            minuteLabel="签到结束时间（分钟）"
-                            onChange={(v) => onWindowChange("checkin_end", v)}
-                          />
-                        </DemoAction>
+                        <TimePicker
+                          className="min-w-0 flex-1 sm:flex-none"
+                          value={cfg.checkin_end}
+                          hourLabel="签到结束时间（小时）"
+                          minuteLabel="签到结束时间（分钟）"
+                          onChange={(v) => onWindowChange("checkin_end", v)}
+                        />
                         {(cfg.checkin_start || cfg.checkin_end) && (
-                          <DemoAction>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="shrink-0"
-                              onClick={clearWindow}
-                            >
-                              清除
-                            </Button>
-                          </DemoAction>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="shrink-0"
+                            onClick={clearWindow}
+                          >
+                            清除
+                          </Button>
                         )}
                       </div>
                       {windowIssue && (
@@ -707,13 +692,11 @@ function AutoCheckinCard() {
                           <span className="min-w-0 flex-1 truncate text-xs leading-4" title={name}>
                             {name}
                           </span>
-                          <DemoAction>
-                            <Switch
-                              checked={!excludedIds.has(account.id)}
-                              onCheckedChange={(allowed) => onAutoCheckinChange(account, allowed)}
-                              aria-label={`${name}参与自动签到`}
-                            />
-                          </DemoAction>
+                          <Switch
+                            checked={!excludedIds.has(account.id)}
+                            onCheckedChange={(allowed) => onAutoCheckinChange(account, allowed)}
+                            aria-label={`${name}参与自动签到`}
+                          />
                         </div>
                       );
                     })
@@ -832,7 +815,6 @@ function AutoTravelRow() {
       label="启用自动旅行"
       description="开启后按官方状态自动派发或领取旅行奖励；切换后立即生效"
       htmlFor="at-enabled"
-      operational
     >
       <Switch
         id="at-enabled"
@@ -843,92 +825,6 @@ function AutoTravelRow() {
       />
     </SettingsFieldRow>
   );
-}
-
-
-/** 权限检测卡片：确认本 App 是否有权写入 WorkBuddy 认证文件（探针与展示路径同档位）。 */
-function PermissionCheckCard() {
-  const authFile = useAuthFile();
-  const variant = useAccountsStore((s) => s.variant);
-  const [checking, setChecking] = useState(false);
-  /** 只在失败时留在卡片内：错误文案与授权四步引导不该被几秒的 toast 吞掉。 */
-  const [error, setError] = useState<string | null>(null);
-
-  async function runCheck() {
-    setChecking(true);
-    setError(null);
-    try {
-      const res = await api.checkAuthPermission(variant);
-      if (res.ok) {
-        toast.success(res.message ?? "认证目录可写，权限正常");
-      } else {
-        setError(`${res.error}（${res.dir ?? ""}）`);
-      }
-    } catch (e) {
-      setError(api.asError(e));
-    } finally {
-      setChecking(false);
-    }
-  }
-
-  return (
-    <SettingsGroup
-      id="settings-permission"
-      title="权限检测"
-    >
-      <CardContent className="space-y-0 p-0">
-        <div className="break-all border-b border-border/60 bg-muted/25 px-4 py-3 font-mono text-[11px] leading-5 text-muted-foreground sm:px-5">
-          {authFile || "认证文件路径未获取"}
-        </div>
-        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
-          <DemoAction><Button size="sm" onClick={runCheck} disabled={checking}>
-            {checking ? "检测中…" : "检测权限"}
-          </Button></DemoAction>
-          <DemoAction><Button
-            size="sm"
-            variant="outline"
-            onClick={() => void api.openPermissionSettings("all_files")}
-          >
-            打开完全磁盘访问
-          </Button></DemoAction>
-          <DemoAction><Button
-            size="sm"
-            variant="outline"
-            onClick={() => void api.openPermissionSettings("app_management")}
-          >
-            打开 App 管理
-          </Button></DemoAction>
-          <DemoAction><Button size="sm" variant="outline" onClick={() => void api.revealAppInFinder()}>
-            在 Finder 中显示
-          </Button></DemoAction>
-        </div>
-
-        {error && (
-          <Alert variant="destructive" className="!w-auto mx-4 my-4 sm:mx-5">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        {error && (
-          <div className="mx-4 mb-4 border-l-2 border-destructive/50 bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground sm:mx-5">
-            <p className="mb-1 font-medium text-foreground">如何授权（拖拽方式）：</p>
-            <ol className="list-decimal space-y-1 pl-4">
-              <li>点上方「打开完全磁盘访问」</li>
-              <li>再点「在 Finder 中显示」打开 workbuddy-switch 所在位置</li>
-              <li>
-                把 <b>workbuddy-switch.app</b> 从 Finder <b>直接拖进</b>完全磁盘访问的列表区域
-                （即使没有提示框，拖入即生效），然后打开它的开关
-              </li>
-              <li>回到本页点「检测权限」，或直接重试切换</li>
-            </ol>
-          </div>
-        )}
-      </CardContent>
-    </SettingsGroup>
-  );
-}
-
-function useAuthFile(): string | undefined {
-  return useAccountsStore((s) => s.status?.authFile);
 }
 
 
@@ -981,7 +877,6 @@ function StartupCard() {
           label="开机时静默启动到托盘"
           description="开关直接反映系统登录项状态；之后可从托盘「打开主界面」恢复"
           htmlFor="startup-silent"
-          operational
         >
           <Switch
             id="startup-silent"
@@ -1135,8 +1030,7 @@ function ErrorLogCard() {
   const [path, setPath] = useState<string | null>(null);
   const [pathError, setPathError] = useState(false);
   const [revealing, setRevealing] = useState(false);
-  // 浏览器演示页没有 Tauri，`isWebui()` 也为真；截图仍要看到路径和按钮。
-  const showReveal = canPersistErrorLog() || api.isDemoMode();
+  const showReveal = canPersistErrorLog();
 
   useEffect(() => {
     let cancelled = false;
@@ -1194,16 +1088,14 @@ function ErrorLogCard() {
         </div>
         {showReveal && (
           <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
-            <DemoAction>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={revealing || !path}
-                onClick={() => void revealLog()}
-              >
-                {revealing ? <Loader2 className="animate-spin" /> : null}打开日志位置
-              </Button>
-            </DemoAction>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={revealing || !path}
+              onClick={() => void revealLog()}
+            >
+              {revealing ? <Loader2 className="animate-spin" /> : null}打开日志位置
+            </Button>
           </div>
         )}
       </CardContent>
@@ -1426,7 +1318,6 @@ function RateLimitCard() {
           label="启用限额监听"
           description="关闭后不扫描日志、账号卡片不显示限额标记；重新开启后恢复"
           htmlFor="rl-enabled"
-          operational
         >
           <Switch
             id="rl-enabled"
@@ -1441,7 +1332,6 @@ function RateLimitCard() {
           label="扫描 CodeBuddy IDE 日志"
           description="IDE 的限额只有日志一条来源，关掉后不再显示；CodeBuddy CLI / WorkBuddy 的实时上报不受影响"
           htmlFor="rl-ide-scan"
-          operational
         >
           <Switch
             id="rl-ide-scan"
@@ -1456,7 +1346,6 @@ function RateLimitCard() {
           className="border-b-0"
           label="接入客户端 hook"
           description={hookDescription}
-          operational
         >
           {status?.installed ? (
             <Button
@@ -1484,24 +1373,23 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：演示模式不渲染自动签到。 */
+/** 设置页。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {api.isDemoMode() ? "限额监听与权限检测配置。" : "自动签到、限额监听与权限检测配置。"}
+          自动签到与限额监听配置。
         </p>
       </header>
 
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
         <SupportedToolsCard />
-        <PermissionCheckCard />
-        {api.isDemoMode() ? null : <AutoCheckinCard />}
+        <AutoCheckinCard />
         <RateLimitCard />
-        {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
+        {api.isDesktop() ? <StartupCard /> : null}
         <NotificationHistoryCard />
         <ErrorLogCard />
       </div>

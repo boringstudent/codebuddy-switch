@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wb-switch-core", "crates/wb-switch-server", "src-tauri"]
+members = ["crates/wb-switch-core", "src-tauri"]
 resolver = "2"
 
 # `schemars 0.8`（tauri-build / tauri-plugin 的传递依赖，且开启了 `preserve_order`）

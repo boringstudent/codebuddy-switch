@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
-  AccountRecord,
   AppNotification,
   AppStatus,
   AutoRotateConfig,
@@ -18,7 +17,6 @@ import type {
   DisplayField,
   TokenStatistics,
   ErrorLogKind,
-  GithubConfig,
   ImportPreviewAccount,
   ImportResult,
   OAuthPollResult,
@@ -42,43 +40,21 @@ import type {
   SwitchResult,
   TravelConfig,
   TravelStatus,
-  UpdateInfo,
-  UpdateSnapshot,
   VscodeExtStatus,
   VscodeExtSwitchResult,
   JetbrainsStatus,
   JetbrainsSwitchResult,
+  ProxyDailyStat,
+  ProxyImportableAccount,
+  ProxyOverview,
+  ProxyRequestLog,
+  ProxyServerStatus,
+  ProxySubKey,
+  ProxyUpstreamKey,
   VscodeSessionList,
   VscodeSessionRef,
   WbVariant,
 } from "./types";
-import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
-import { screenshotDemoResponse } from "./screenshot-demo";
-
-/**
- * 双通道适配层：
- * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
- */
-const API_BASE = "http://127.0.0.1:57890";
-
-const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
-  "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
-  "get_token_statistics",
-  "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
-  "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
-  "get_travel_status", "get_auto_travel_config", "get_rate_limits",
-  "get_rate_limit_hook_status", "get_rate_limit_config",
-]);
-
-export function isDemoMode(): boolean {
-  return demoModeEnabled;
-}
-
-export function isWebui(): boolean {
-  return typeof window !== "undefined" && !("__TAURI_INTERNALS__" in window);
-}
 
 /** Tauri mobile 也注入内部 API；用现有平台 UA 约定把桌面宿主与移动宿主区分开。 */
 function isMobilePlatform(): boolean {
@@ -92,162 +68,23 @@ function isMobilePlatform(): boolean {
 
 /** 是否为提供桌面专属能力的 Tauri 宿主。 */
 export function isDesktop(): boolean {
-  return !isWebui() && !isMobilePlatform();
+  return !isMobilePlatform();
 }
 
-/** Agent Companion 只由桌面宿主管理，不能经 WebUI 或演示模式访问。 */
+/** Agent Companion 只由桌面宿主管理。 */
 function requireCompanionDesktop(): void {
-  if (demoModeEnabled) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
   if (!isDesktop()) throw new Error("Agent Companion 仅在桌面版中可用");
 }
-
-type Route = { method: "GET" | "POST"; path: string };
-
-/** Tauri command → HTTP 路由映射（webui 模式）。 */
-const ROUTES: Record<string, Route> = {
-  get_status: { method: "GET", path: "/api/status" },
-  get_accounts: { method: "GET", path: "/api/accounts" },
-  get_codebuddy_cli_status: { method: "GET", path: "/api/codebuddy-cli/status" },
-  install_codebuddy_cli_helper: { method: "POST", path: "/api/codebuddy-cli/install-helper" },
-  switch_codebuddy_cli_account: { method: "POST", path: "/api/codebuddy-cli/switch" },
-  get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
-  switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
-  detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
-  list_codebuddy_ide_sessions: { method: "GET", path: "/api/codebuddy-cn-ide/sessions" },
-  codebuddy_ide_session_links_preview: {
-    method: "POST",
-    path: "/api/codebuddy-cn-ide/session-links",
-  },
-  get_vscode_ext_status: { method: "GET", path: "/api/vscode-ext/status" },
-  get_jetbrains_status: { method: "GET", path: "/api/jetbrains/status" },
-  switch_jetbrains_account: { method: "POST", path: "/api/jetbrains/switch" },
-  detect_jetbrains_account: { method: "POST", path: "/api/jetbrains/detect" },
-  list_vscode_sessions: { method: "GET", path: "/api/vscode-ext/sessions" },
-  switch_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/switch" },
-  vscode_session_links_preview: { method: "POST", path: "/api/vscode-ext/session-links" },
-  detect_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/detect" },
-  get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
-  switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
-  detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
-  list_codebuddy_intl_ide_sessions: { method: "GET", path: "/api/codebuddy-ide/sessions" },
-  codebuddy_intl_ide_session_links_preview: {
-    method: "POST",
-    path: "/api/codebuddy-ide/session-links",
-  },
-  delete_account: { method: "POST", path: "/api/delete" },
-  update_account_display: { method: "POST", path: "/api/update-account-display" },
-  oauth_start: { method: "POST", path: "/api/oauth/start" },
-  oauth_status: { method: "POST", path: "/api/oauth/status" },
-  import_local: { method: "POST", path: "/api/import-local" },
-  export_accounts: { method: "POST", path: "/api/export-accounts" },
-  export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
-  preview_import_accounts: { method: "POST", path: "/api/import/preview" },
-  import_accounts: { method: "POST", path: "/api/import" },
-  switch_account: { method: "POST", path: "/api/switch" },
-  list_sessions: { method: "GET", path: "/api/sessions" },
-  list_account_sessions: { method: "GET", path: "/api/sessions/account" },
-  copy_sessions: { method: "POST", path: "/api/sessions/copy" },
-  copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
-  session_links_preview: { method: "POST", path: "/api/session-links/preview" },
-  session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
-  session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
-  list_session_groups: { method: "POST", path: "/api/session-groups/list" },
-  get_session_group: { method: "POST", path: "/api/session-groups/detail" },
-  preview_session_group_pair: { method: "POST", path: "/api/session-groups/preview" },
-  sync_session_group_pair: { method: "POST", path: "/api/session-groups/sync" },
-  sync_session_group_unify: { method: "POST", path: "/api/session-groups/unify" },
-  sync_session_group_safe_batch: { method: "POST", path: "/api/session-groups/sync-safe" },
-  add_session_group_member: { method: "POST", path: "/api/session-groups/add" },
-  copy_linked_sessions: { method: "POST", path: "/api/session-groups/copy-linked" },
-  vscode_restart_precheck: { method: "POST", path: "/api/vscode-ext/restart-precheck" },
-  unlink_session_group_member: { method: "POST", path: "/api/session-groups/unlink" },
-  delete_session_group: { method: "POST", path: "/api/session-groups/delete" },
-  get_checkin_status: { method: "GET", path: "/api/checkin/status" },
-  get_credit_expiry: { method: "POST", path: "/api/credits" },
-  get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
-  get_token_statistics: { method: "GET", path: "/api/token-stats" },
-  get_rate_limits: { method: "GET", path: "/api/rate-limits" },
-  get_rate_limit_hook_status: { method: "GET", path: "/api/rate-limits/hook-status" },
-  install_rate_limit_hook: { method: "POST", path: "/api/rate-limits/install-hook" },
-  uninstall_rate_limit_hook: { method: "POST", path: "/api/rate-limits/uninstall-hook" },
-  get_rate_limit_config: { method: "GET", path: "/api/rate-limits/config" },
-  save_rate_limit_config: { method: "POST", path: "/api/rate-limits/config" },
-  checkin: { method: "POST", path: "/api/checkin" },
-  checkin_all: { method: "POST", path: "/api/checkin/all" },
-  get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
-  save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
-  get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
-  list_notifications: { method: "GET", path: "/api/notifications" },
-  record_notification: { method: "POST", path: "/api/notifications/record" },
-  clear_notifications: { method: "POST", path: "/api/notifications/clear" },
-  get_travel_status: { method: "GET", path: "/api/travel/status" },
-  get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
-  save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
-  get_auto_rotate_config: { method: "GET", path: "/api/rotate/config" },
-  save_auto_rotate_config: { method: "POST", path: "/api/rotate/config" },
-  rotate_status: { method: "GET", path: "/api/rotate/status" },
-  run_rotate: { method: "POST", path: "/api/rotate/run" },
-  get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
-  refresh_account_token: { method: "POST", path: "/api/refresh-token" },
-  get_github_config: { method: "GET", path: "/api/update/config" },
-  save_github_config: { method: "POST", path: "/api/update/config" },
-  check_update: { method: "GET", path: "/api/update/check" },
-  switch_progress: { method: "GET", path: "/api/switch/progress" },
-};
-
 /**
- * 档位参数只在国际版时下发：缺省（国内版）保持改造前的请求体逐字一致，
- * Tauri 走 `invoke(cmd, undefined)`，HTTP 走无 query 的路径。
+ * 档位参数只在国际版时下发：缺省（国内版）保持改造前的请求体逐字一致。
  */
 function variantArgs(variant?: WbVariant): Record<string, unknown> | undefined {
   return variant === "ai" ? { variant } : undefined;
 }
 
-function queryString(args?: Record<string, unknown>): string {
-  if (!args) return "";
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(args)) {
-    if (value === undefined || value === null) continue;
-    params.set(key, String(value));
-  }
-  const text = params.toString();
-  return text ? `?${text}` : "";
-}
-
-async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const route = ROUTES[cmd];
-  if (!route) throw new Error(`webui 模式暂不支持该操作: ${cmd}`);
-  let res: Response;
-  try {
-    const url =
-      route.method === "GET"
-        ? `${API_BASE}${route.path}${queryString(args)}`
-        : `${API_BASE}${route.path}`;
-    res = await fetch(url, {
-      method: route.method,
-      headers: { "Content-Type": "application/json" },
-      body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
-    });
-  } catch {
-    throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.message || data.error || `请求失败 (${res.status})`);
-  }
-  return data as T;
-}
-
+/** 桌面 App（Tauri）唯一通道：`invoke` 调用 Rust commands。 */
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (demoModeEnabled) {
-    if (cmd === "get_credit_statistics" && args?.refresh === true) {
-      throw new Error(DEMO_UNAVAILABLE_MESSAGE);
-    }
-    if (!DEMO_READ_COMMANDS.has(cmd)) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
-    return screenshotDemoResponse(cmd, args) as T;
-  }
-  if (!isWebui()) return invoke<T>(cmd, args);
-  return httpCall<T>(cmd, args);
+  return invoke<T>(cmd, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,22 +119,6 @@ export function switchCodebuddyCliAccount(
   accountId: string,
   closeRunningCli = false,
 ): Promise<CodeBuddyCliSwitchResult> {
-  if (demoModeEnabled) {
-    return new Promise((resolve, reject) => {
-      window.setTimeout(() => {
-        try {
-          resolve(
-            screenshotDemoResponse("switch_codebuddy_cli_account", {
-              accountId,
-              closeRunningCli,
-            }) as CodeBuddyCliSwitchResult,
-          );
-        } catch (error) {
-          reject(error);
-        }
-      }, 1200);
-    });
-  }
   return call("switch_codebuddy_cli_account", { accountId, closeRunningCli });
 }
 
@@ -480,14 +301,6 @@ export function updateAccountDisplay(
   accountId: string,
   patch: { note?: string | null; displayField?: DisplayField },
 ): Promise<{ ok: boolean; account: AccountMeta }> {
-  if (demoModeEnabled) {
-    return Promise.resolve(
-      screenshotDemoResponse("update_account_display", { accountId, patch }) as {
-        ok: boolean;
-        account: AccountMeta;
-      },
-    );
-  }
   return call("update_account_display", { accountId, patch });
 }
 
@@ -503,10 +316,6 @@ export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
 /** 导入本机当前登录态；`variant` 缺省为国内版（对应各自的登录态文件）。 */
 export function importLocal(variant?: WbVariant): Promise<{ ok: boolean; account: AccountMeta }> {
   return call("import_local", variantArgs(variant));
-}
-
-export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; accounts: AccountRecord[] }> {
-  return call("export_accounts", { accountIds });
 }
 
 /** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
@@ -535,11 +344,6 @@ export function switchAccount(args: {
   syncSelections?: SessionSyncSelection[];
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
-}
-
-/** 切换进度（webui 轮询用；桌面端走事件，此函数无副作用）。 */
-export function switchProgress(): Promise<{ running: boolean; progress: string | null }> {
-  return call("switch_progress");
 }
 
 /** 当前登录态的会话列表；`variant` 缺省为国内版。 */
@@ -656,7 +460,6 @@ export function syncSessionGroupPair(args: {
   /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
   restart?: boolean;
 }): Promise<SessionGroupActionReport> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("sync_session_group_pair", args as unknown as Record<string, unknown>);
 }
 
@@ -668,12 +471,10 @@ export function syncSessionGroupUnify(args: {
   /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
   restart?: boolean;
 }): Promise<SessionGroupActionReport> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("sync_session_group_unify", args as unknown as Record<string, unknown>);
 }
 
 export function syncSessionGroupSafeBatch(client: SessionGroupClient, groupId: string, variantScope?: WbVariant, restart?: boolean): Promise<SessionGroupActionReport> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("sync_session_group_safe_batch", { client, groupId, ...(variantScope ? { variantScope } : {}), ...(restart ? { restart: true } : {}) });
 }
 
@@ -686,7 +487,6 @@ export function addSessionGroupMember(args: {
   /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
   restart?: boolean;
 }): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; /** 内容缺失 / 索引丢失而被跳过的会话。 */ skipped?: { id: string; error: string }[]; [key: string]: unknown }> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("add_session_group_member", args as unknown as Record<string, unknown>);
 }
 
@@ -699,7 +499,6 @@ export function copyLinkedSessions(args: {
   /** 已获用户授权（确认框）时传 `true`：运行中允许关闭并重开 VS Code。 */
   restart?: boolean;
 }): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; [key: string]: unknown }> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("copy_linked_sessions", args as unknown as Record<string, unknown>);
 }
 
@@ -719,7 +518,6 @@ export function unlinkSessionGroupMember(args: {
   memberId: string;
   variantScope?: WbVariant;
 }): Promise<{ status: "removed" | "groupRemoved"; client: SessionGroupClient; groupId: string; memberId: string; remaining: number }> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("unlink_session_group_member", args as unknown as Record<string, unknown>);
 }
 
@@ -731,20 +529,17 @@ export function deleteSessionGroup(args: {
   groupId: string;
   variantScope?: WbVariant;
 }): Promise<{ status: "groupRemoved"; client: SessionGroupClient; groupId: string; removed: number }> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   return call("delete_session_group", args as unknown as Record<string, unknown>);
 }
 
-/** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
+/** 打开系统设置授权面板。 */
 export function openPermissionSettings(
   target?: "app_management" | "all_files",
 ): Promise<void> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
-  if (isWebui()) return Promise.resolve();
   return call("open_permission_settings", { target: target ?? "app_management" });
 }
 
-/** 权限自检：桌面端写探针（按档位写在对应登录态文件旁）；webui 模式由服务进程权限决定。 */
+/** 权限自检：写探针（按档位写在对应登录态文件旁）。 */
 export function checkAuthPermission(variant?: WbVariant): Promise<{
   ok: boolean;
   message?: string;
@@ -752,21 +547,11 @@ export function checkAuthPermission(variant?: WbVariant): Promise<{
   dir?: string;
   hint?: string;
 }> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
-  if (isWebui()) {
-    return Promise.resolve({
-      ok: true,
-      message: "webui 模式由服务进程（终端启动）的权限决定，无需额外授权",
-      hint: "",
-    });
-  }
   return call("check_auth_permission", variantArgs(variant));
 }
 
-/** 在 Finder 中显示当前 App（桌面端专用；webui 无操作）。 */
+/** 在 Finder 中显示当前 App。 */
 export function revealAppInFinder(): Promise<void> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
-  if (isWebui()) return Promise.resolve();
   return call("reveal_app_in_finder");
 }
 
@@ -903,19 +688,6 @@ export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
 }
 
 export async function getTravelStatus(accountId: string): Promise<TravelStatus> {
-  if (demoModeEnabled) {
-    return screenshotDemoResponse("get_travel_status", { accountId }) as TravelStatus;
-  }
-  if (isWebui()) {
-    // webui 端为批量接口，按 accountId 过滤
-    const all = await httpCall<{
-      accounts: { accountId: string; email: string; label: TravelStatus["label"]; rewardCredit: number | null; locationName?: string | null; arriveAt?: number | null }[];
-    }>("get_travel_status");
-    const one = all.accounts.find((a) => a.accountId === accountId);
-    return one
-      ? { label: one.label, rewardCredit: one.rewardCredit, locationName: one.locationName ?? null, arriveAt: one.arriveAt ?? null }
-      : { label: "untraveled", rewardCredit: null, locationName: null, arriveAt: null };
-  }
   return call("get_travel_status", { accountId });
 }
 
@@ -969,92 +741,17 @@ export function refreshAccountToken(accountId: string): Promise<AccountMeta> {
 }
 
 // ---------------------------------------------------------------------------
-// 阶段 4：自动更新
-// ---------------------------------------------------------------------------
-
-export function getGithubConfig(): Promise<GithubConfig> {
-  return call("get_github_config");
-}
-
-export function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
-  return call("save_github_config", {
-    config: config as unknown as Record<string, unknown>,
-  });
-}
-
-export function checkUpdate(proxy?: string, force?: boolean): Promise<UpdateInfo> {
-  return call("check_update", { proxy: proxy?.trim() || null, force: force ?? false });
-}
-
-export function relaunchApp(): Promise<void> {
-  return call("relaunch_app");
-}
-
-// ---------------------------------------------------------------------------
-// 统一更新服务（桌面端；`update-state` 事件是阶段与进度的唯一来源）
-// ---------------------------------------------------------------------------
-
-/** 浏览器 / 演示模式没有更新服务：与弹窗既有文案逐字一致。 */
-const UPDATE_UNSUPPORTED_MESSAGE = "浏览器 webui 模式不能直接安装桌面更新包";
-
-/**
- * 更新状态快照（前端首屏初始化；之后由 `update-state` 事件推送）。
- *
- * webui 没有更新服务、演示模式禁止真实下载，两者都回落到静态快照：
- * 演示模式给「有新版」态，保证演示页 / 截图里的升级入口与外链完整。
- */
-export function updateState(): Promise<UpdateSnapshot> {
-  if (demoModeEnabled) {
-    // 复用只读演示数据的版本号，避免版本号在两处硬编码。
-    const demo = screenshotDemoResponse("check_update") as UpdateInfo;
-    return Promise.resolve({
-      phase: "available",
-      latest: demo.latest ?? null,
-      percent: null,
-      message: null,
-      checkedAt: null,
-    });
-  }
-  if (isWebui()) {
-    return Promise.resolve({
-      phase: "idle",
-      latest: null,
-      percent: null,
-      message: null,
-      checkedAt: null,
-    });
-  }
-  return call("update_state");
-}
-
-/** 启动更新包下载（异步，立即返回；进度走 `update-state` 事件与托盘）。 */
-export function updateDownload(): Promise<void> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
-  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
-  return call<unknown>("update_download").then(() => undefined);
-}
-
-/** 安装已下载的更新包并重启（用户点「重启以完成升级」时调用）。 */
-export function updateRestart(): Promise<void> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
-  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
-  return call<unknown>("update_restart").then(() => undefined);
-}
-
-// ---------------------------------------------------------------------------
-// 开机自启（仅桌面端；webui 不提供同名接口，卡片也不在 webui 渲染）
+// 开机自启（仅桌面端）
 // ---------------------------------------------------------------------------
 
 /** 查询系统当前的开机自启注册状态（桌面端）。 */
 export function getLaunchAtLoginEnabled(): Promise<boolean> {
-  if (demoModeEnabled) return call("get_launch_at_login_enabled");
   if (!isDesktop()) return Promise.resolve(false);
   return call("get_launch_at_login_enabled");
 }
 
 /** 注册 / 移除系统开机自启，返回回读后的权威状态（桌面端）。 */
 export function setLaunchAtLoginEnabled(enabled: boolean): Promise<boolean> {
-  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   if (!isDesktop()) return Promise.resolve(false);
   return call("set_launch_at_login_enabled", { enabled });
 }
@@ -1076,19 +773,16 @@ export function recordNotification(
   title: string,
   description?: string,
 ): Promise<{ recorded: boolean }> {
-  if (demoModeEnabled) return Promise.resolve({ recorded: false });
   return call("record_notification", { level, title, description });
 }
 
 /** 读取最近的通知（新的在前，最多 100 条）。 */
 export function listNotifications(): Promise<{ items: AppNotification[] }> {
-  if (demoModeEnabled) return Promise.resolve({ items: [] });
   return call("list_notifications");
 }
 
 /** 清空通知存档。 */
 export function clearNotifications(): Promise<{ cleared: boolean }> {
-  if (demoModeEnabled) return Promise.resolve({ cleared: false });
   return call("clear_notifications");
 }
 
@@ -1096,13 +790,8 @@ export function clearNotifications(): Promise<{ cleared: boolean }> {
 // 错误日志（前端崩溃 / 未捕获错误落盘，见 lib/error-report.ts）
 // ---------------------------------------------------------------------------
 
-/**
- * 上报一条错误到本地错误日志（桌面端落盘 `~/.wb-switch/error.log`）。
- *
- * webui / 演示模式没有落盘通道：静默忽略（调用方的本地提示不受影响）。
- */
+/** 上报一条错误到本地错误日志（落盘 `~/.wb-switch/error.log`）。 */
 export function logError(kind: ErrorLogKind, message: string, detail?: string): Promise<void> {
-  if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("log_error", { kind, message, detail: detail ?? null }).then(
     () => undefined,
   );
@@ -1110,15 +799,99 @@ export function logError(kind: ErrorLogKind, message: string, detail?: string): 
 
 /** 错误日志文件路径（设置页展示）。 */
 export function getErrorLogPath(): Promise<string> {
-  // 演示模式给一条与其它演示路径同风格的值，保证演示页 / 截图里界面完整。
-  if (demoModeEnabled) return Promise.resolve("/demo/.wb-switch/error.log");
-  // webui 没有落盘通道（不写服务端日志），设置页不展示路径。
-  if (isWebui()) return Promise.resolve("");
   return call<string>("get_error_log_path");
 }
 
-/** 在文件管理器中定位错误日志（桌面端；日志尚未生成时由后端打开所在目录）。 */
+/** 在文件管理器中定位错误日志（日志尚未生成时由后端打开所在目录）。 */
 export function revealErrorLog(): Promise<void> {
-  if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("reveal_error_log").then(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
+// API 反向代理（本地 OpenAI 兼容中转服务）
+// ---------------------------------------------------------------------------
+
+export function getProxyStatus(): Promise<ProxyServerStatus> {
+  return call("get_proxy_status");
+}
+
+export function getProxyOverview(): Promise<ProxyOverview> {
+  return call("get_proxy_overview");
+}
+
+export function startProxyServer(port: number, mode: string): Promise<ProxyServerStatus> {
+  return call("start_proxy_server", { port, mode });
+}
+
+export function stopProxyServer(): Promise<ProxyServerStatus> {
+  return call("stop_proxy_server");
+}
+
+export function saveProxySettings(settings: Record<string, unknown>): Promise<ProxyServerStatus> {
+  return call("save_proxy_settings", { settings });
+}
+
+export function listProxyUpstreamKeys(): Promise<{ keys: ProxyUpstreamKey[] }> {
+  return call("list_proxy_upstream_keys");
+}
+
+export function listProxyImportableAccounts(): Promise<{ accounts: ProxyImportableAccount[] }> {
+  return call("list_proxy_importable_accounts");
+}
+
+export function importProxyAccounts(accountIds: string[]): Promise<{ imported: number }> {
+  return call("import_proxy_accounts", { accountIds });
+}
+
+export function updateProxyUpstreamKey(
+  keyId: string,
+  updates: Record<string, unknown>,
+): Promise<{ ok: boolean }> {
+  return call("update_proxy_upstream_key", { keyId, updates });
+}
+
+export function deleteProxyUpstreamKey(keyId: string): Promise<{ ok: boolean }> {
+  return call("delete_proxy_upstream_key", { keyId });
+}
+
+export function refreshProxyKeyPoints(): Promise<{ success: number; failed: number }> {
+  return call("refresh_proxy_key_points");
+}
+
+export function checkProxyKeyStatus(): Promise<{ normal: number; abnormal: number; failed: number }> {
+  return call("check_proxy_key_status");
+}
+
+export function listProxySubKeys(): Promise<{ keys: ProxySubKey[] }> {
+  return call("list_proxy_sub_keys");
+}
+
+export function createProxySubKey(data: Record<string, unknown>): Promise<{ ok: boolean; key: ProxySubKey }> {
+  return call("create_proxy_sub_key", { data });
+}
+
+export function updateProxySubKey(
+  keyId: string,
+  updates: Record<string, unknown>,
+): Promise<{ ok: boolean }> {
+  return call("update_proxy_sub_key", { keyId, updates });
+}
+
+export function deleteProxySubKey(keyId: string): Promise<{ ok: boolean }> {
+  return call("delete_proxy_sub_key", { keyId });
+}
+
+export function getProxyLogs(since = 0, limit = 200): Promise<{ logs: ProxyRequestLog[] }> {
+  return call("get_proxy_logs", { since, limit });
+}
+
+export function clearProxyLogs(): Promise<{ ok: boolean }> {
+  return call("clear_proxy_logs");
+}
+
+export function getProxyDailyStats(
+  category: "upstream" | "sub",
+  keyId: string,
+): Promise<Record<string, ProxyDailyStat>> {
+  return call("get_proxy_daily_stats", { category, keyId });
 }

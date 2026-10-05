@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>workbuddy-switch · WorkBuddy 账号切换</title>
+    <title>CodeBuddy · WorkBuddy 账号切换</title>
     <!--
       首屏兜底样式：纯内联，不引用任何外部资源（离线 / 资源加载失败时同样可见）。
       正常启动时 React 挂载会清空 #root，占位自然消失；主题跟随系统，避免深色下闪白。
@@ -99,8 +99,7 @@
     <script>
       (function () {
         var timeoutMs = 10000;
-        // 与 src/lib/update.ts 的 GITHUB_RELEASE_URL 一致（内联脚本不能引用打包产物）。
-        var releaseUrl = "https://github.com/changexbc/workbuddy-switch/releases/latest";
+        var releaseUrl = "https://github.com/boringstudent/codebuddy-switch/releases/latest";
         window.setTimeout(function () {
           if (window.__WB_MOUNTED__) return;
           var root = document.getElementById("root");
@@ -116,7 +115,7 @@
           var text = document.createElement("div");
           text.className = "wb-boot-text";
           text.textContent =
-            "界面未能正常加载。可以先点「重新加载」再试一次；如果一直失败，可从托盘菜单「检查更新」升级到最新版本。";
+            "界面未能正常加载。可以先点「重新加载」再试一次；如果一直失败，请下载最新版本重装。";
 
           var actions = document.createElement("div");
           actions.className = "wb-boot-actions";

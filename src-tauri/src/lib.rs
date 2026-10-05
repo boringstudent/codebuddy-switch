@@ -9,12 +9,6 @@ use std::time::Duration;
 use tauri::Emitter;
 use wb_switch_core::modules;
 
-const SCREENSHOT_DEMO_ENV: &str = "WB_SWITCH_SCREENSHOT_DEMO";
-
-pub(crate) fn is_screenshot_demo() -> bool {
-    std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
-}
-
 /// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
 /// 签到时间段时固定 30 分钟）；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
@@ -129,10 +123,11 @@ pub fn run() {
                     tray::is_silent_startup(std::env::args()),
                 );
             }
-            // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
-            if !is_screenshot_demo() {
-                spawn_background_loops(app.handle().clone());
-            }
+            spawn_background_loops(app.handle().clone());
+            // API 反代：按设置自启（settings.auto_start）。
+            tauri::async_runtime::spawn(async {
+                modules::proxy::auto_start_proxy_server().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -196,6 +191,25 @@ pub fn run() {
             commands::log_error,
             commands::get_error_log_path,
             commands::reveal_error_log,
+            commands::get_proxy_status,
+            commands::get_proxy_overview,
+            commands::start_proxy_server,
+            commands::stop_proxy_server,
+            commands::save_proxy_settings,
+            commands::list_proxy_upstream_keys,
+            commands::list_proxy_importable_accounts,
+            commands::import_proxy_accounts,
+            commands::update_proxy_upstream_key,
+            commands::delete_proxy_upstream_key,
+            commands::refresh_proxy_key_points,
+            commands::check_proxy_key_status,
+            commands::list_proxy_sub_keys,
+            commands::create_proxy_sub_key,
+            commands::update_proxy_sub_key,
+            commands::delete_proxy_sub_key,
+            commands::get_proxy_logs,
+            commands::clear_proxy_logs,
+            commands::get_proxy_daily_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

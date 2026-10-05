@@ -20,12 +20,9 @@ const TOAST_SUMMARY_MAX = 120;
 /** 去重表上限：超出后顺带清理过期项，避免长时间运行无限增长。 */
 const DEDUPE_MAX_ENTRIES = 50;
 
-/**
- * 桌面端才会把错误写入 `~/.wb-switch/error.log`。
- * webui / 演示模式没有落盘通道。
- */
+/** 错误写入 `~/.wb-switch/error.log`。 */
 export function canPersistErrorLog(): boolean {
-  return !api.isDemoMode() && !api.isWebui();
+  return true;
 }
 
 const lastReportedAt = new Map<string, number>();

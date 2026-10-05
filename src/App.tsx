@@ -1,34 +1,19 @@
-import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { MessagesSquare, Settings, Sparkles, User } from "lucide-react";
+import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
+import { ChartColumn, Network, Settings, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import AccountsPage from "@/pages/AccountsPage";
-import CreditStatsPage from "@/pages/CreditStatsPage";
-import TokenStatsPage from "@/pages/TokenStatsPage";
+import UsageStatsPage from "@/pages/UsageStatsPage";
+import ApiProxyPage from "@/pages/ApiProxyPage";
 import SettingsPage from "@/pages/SettingsPage";
-import { StatusDot, AppIconMark } from "@/components/product-marks";
-import { Badge } from "@/components/ui/badge";
+import { AppIconMark } from "@/components/product-marks";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
-import { useAccountsStore } from "@/stores/accounts";
-
-function VersionFooter({ running }: { running: boolean | undefined }) {
-  return (
-    <section className="mt-auto border-t border-sidebar-border px-2 pt-3 text-xs">
-      <div className="flex items-center gap-2 text-[13px] text-sidebar-foreground">
-        <StatusDot on={Boolean(running)} />
-        <span className="min-w-0 flex-1 truncate">WorkBuddy</span>
-      </div>
-    </section>
-  );
-}
 
 function Layout() {
-  const running = useAccountsStore((s) => s.status?.running);
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
@@ -59,13 +44,8 @@ function Layout() {
                 fontWeight: 640,
               }}
             >
-              codeBuddy
+              CodeBuddy
             </div>
-            {demoModeEnabled && (
-              <Badge variant="secondary" className="mt-1 h-5 border-0 px-1.5 text-[10px] text-sidebar-foreground/60 shadow-none">
-                演示模式
-              </Badge>
-            )}
           </div>
         </div>
         <nav className="flex min-h-0 flex-1 flex-col gap-0.5" aria-label="主导航">
@@ -84,9 +64,8 @@ function Layout() {
             <User className="size-4" />
             账号管理
           </NavLink>
-          <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
-            to="/credit-stats"
+            to="/usage-stats"
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
@@ -96,8 +75,22 @@ function Layout() {
               )
             }
           >
-            <Sparkles className="size-4" />
-            积分统计
+            <ChartColumn className="size-4" />
+            用量统计
+          </NavLink>
+          <NavLink
+            to="/api-proxy"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Network className="size-4" />
+            API 代理
           </NavLink>
           <NavLink
             to="/settings"
@@ -114,7 +107,6 @@ function Layout() {
             设置
           </NavLink>
         </nav>
-        {api.isWebui() && !demoModeEnabled ? null : <VersionFooter running={running} />}
       </aside>
       <main
         className={cn(
@@ -129,22 +121,22 @@ function Layout() {
 }
 
 export default function App() {
-  const Router = pagesDemoHostingEnabled ? HashRouter : BrowserRouter;
-
   return (
     <TooltipProvider delayDuration={250}>
-      <Router>
+      <BrowserRouter>
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
-            <Route path="/credit-stats" element={<CreditStatsPage />} />
-            <Route path="/token-stats" element={<TokenStatsPage />} />
+            <Route path="/usage-stats" element={<UsageStatsPage />} />
+            <Route path="/credit-stats" element={<Navigate to="/usage-stats" replace />} />
+            <Route path="/token-stats" element={<Navigate to="/usage-stats" replace />} />
+            <Route path="/api-proxy" element={<ApiProxyPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
         <Toaster />
-      </Router>
+      </BrowserRouter>
     </TooltipProvider>
   );
 }

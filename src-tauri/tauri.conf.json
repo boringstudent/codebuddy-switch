@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "codeBuddy",
+  "productName": "CodeBuddy",
   "version": "0.1.58",
   "identifier": "com.wbswitch.app",
   "build": {
@@ -14,9 +14,9 @@
     "windows": [
       {
         "label": "main",
-        "title": "codeBuddy",
-        "width": 1000,
-        "height": 720,
+        "title": "CodeBuddy",
+        "width": 1400,
+        "height": 900,
         "minWidth": 720,
         "minHeight": 520,
         "decorations": true,

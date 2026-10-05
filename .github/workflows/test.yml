@@ -53,19 +53,16 @@ jobs:
         run: cargo test -p wb-switch-core
 
       # linux 专属 cfg 分支只在 ubuntu 上展开（macOS 侧由 lint job 覆盖）。
-      # rust-embed 要求 #[folder] 目录存在，先建 dist 占位（前端产物由 build.yml 产出）。
       - name: Clippy (linux cfg)
         if: runner.os == 'Linux'
-        run: |
-          mkdir -p dist
-          cargo clippy -p wb-switch-core -p wb-switch-server --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p wb-switch-core --all-targets --no-deps -- -D warnings
 
   # 前端类型、格式与 lint 门禁。跑在 macOS 上：clippy 按宿主平台展开 cfg 分支，
   # 与开发者本机一致，本地全绿即 CI 全绿。linux 专属分支由 rust-tests 的 ubuntu
   # job 覆盖，windows 分支暂未纳入。
   # clippy 必须带 --no-deps：vendor/agent-companion 是 path 依赖快照，其告警不归本仓库。
   lint:
-    name: lint (tsc + fmt + clippy + server tests)
+    name: lint (tsc + fmt + clippy)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -105,16 +102,12 @@ jobs:
           touch "src-tauri/binaries/agent-studio-runtime-$(rustc -vV | sed -n "s/^host: //p")"
 
       - name: Check formatting
-        run: cargo fmt --check -p wb-switch-core -p wb-switch-server -p wb-switch-rust
+        run: cargo fmt --check -p wb-switch-core -p wb-switch-rust
 
       - name: Clippy
-        run: cargo clippy -p wb-switch-core -p wb-switch-server -p wb-switch-rust --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p wb-switch-core -p wb-switch-rust --all-targets --no-deps -- -D warnings
 
-      # server 的 8 个测试此前从不运行（rust-tests 只覆盖 core）。
-      - name: Server tests
-        run: cargo test -p wb-switch-server
-
-      # src-tauri 的 40 个测试此前从不运行（rust-tests 只覆盖 core）。
+      # src-tauri 的测试（rust-tests 只覆盖 core）。
       # 前置 dist 与 stub companion binary 已由上方步骤就位。
       - name: Desktop app tests
         run: cargo test -p wb-switch-rust

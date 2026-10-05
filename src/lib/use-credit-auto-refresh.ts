@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 
-import * as api from "@/lib/api";
 import { useAccountsStore } from "@/stores/accounts";
 
 /** Keep credits fresh while the main window is visible; pause when it is hidden. */
@@ -69,13 +68,11 @@ export function useCreditAutoRefresh() {
     document.addEventListener("visibilitychange", onVisibility);
 
     let unlisten: (() => void) | undefined;
-    if (!api.isWebui()) {
-      void listen<boolean>("main-window-visible", (event) => {
-        setVisible(event.payload);
-      }).then((fn) => {
-        unlisten = fn;
-      });
-    }
+    void listen<boolean>("main-window-visible", (event) => {
+      setVisible(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
 
     return () => {
       stopTimer();

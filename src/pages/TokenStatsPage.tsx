@@ -30,7 +30,6 @@ import {
   ChartTooltip,
   type ChartConfig,
 } from "@/components/ui/chart";
-import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyCnIdeMark, WorkBuddyMark } from "@/components/product-marks";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -1224,7 +1223,7 @@ function TokenStatsLoadingSkeleton() {
   );
 }
 
-export default function TokenStatsPage() {
+export default function TokenStatsPage({ embedded = false }: { embedded?: boolean }) {
   const [stats, setStats] = useState<TokenStatistics | null>(null);
   const [active, setActive] = useState<SourceKey>(readPreferredTokenSource);
   const [loading, setLoading] = useState(true);
@@ -1267,17 +1266,17 @@ export default function TokenStatsPage() {
   const source = stats?.sources.find((item) => item.source === active);
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
+    <div className={embedded ? "min-w-0" : "mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9"}>
       <header className="mb-6 flex min-w-0 flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           {loading && !stats ? (
             <div aria-hidden="true">
-              <Skeleton className="h-8 w-40" />
+              {embedded ? null : <Skeleton className="h-8 w-40" />}
               <Skeleton className="mt-2 h-5 w-64 max-w-full" />
             </div>
           ) : (
             <>
-              <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
+              {embedded ? null : <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>}
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                 当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}
               </p>
@@ -1285,18 +1284,16 @@ export default function TokenStatsPage() {
           )}
         </div>
         <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
-          <DemoAction>
-            <Button
-              className="shrink-0"
-              variant="outline"
-              size="sm"
-              onClick={() => setReload((value) => value + 1)}
-              disabled={loading}
-            >
-              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              刷新统计
-            </Button>
-          </DemoAction>
+          <Button
+            className="shrink-0"
+            variant="outline"
+            size="sm"
+            onClick={() => setReload((value) => value + 1)}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            刷新统计
+          </Button>
         </div>
       </header>
 

@@ -791,48 +791,6 @@ export interface CodeBuddyCliInstallResult {
   error?: string;
 }
 
-export interface GithubConfig {
-  owner?: string;
-  repo?: string;
-  proxy?: string;
-}
-
-export interface UpdateInfo {
-  ok: boolean;
-  current?: string;
-  latest?: string;
-  latestTag?: string;
-  hasUpdate?: boolean;
-  releaseName?: string;
-  releaseUrl?: string;
-  publishedAt?: string;
-  error?: string;
-  message?: string;
-}
-
-/** 统一更新服务的阶段（Rust 状态机，经 `update-state` 事件推送）。 */
-export type UpdatePhase =
-  | "idle"
-  | "checking"
-  | "upToDate"
-  | "available"
-  | "downloading"
-  | "readyToRestart"
-  | "error";
-
-/**
- * 更新状态快照：托盘菜单与前端弹窗显示同一阶段（单一真相源在 Rust）。
- *
- * `latest` 无 `v` 前缀；`percent` 在下载总量未知时为 null；`message` 是错误 / 提示文案。
- */
-export interface UpdateSnapshot {
-  phase: UpdatePhase;
-  latest: string | null;
-  percent: number | null;
-  message: string | null;
-  checkedAt: number | null;
-}
-
 /** CodeBuddy CN IDE（桌面客户端）状态；与 CodeBuddy CLI 独立。 */
 export interface CodeBuddyCnIdeStatus {
   installed: boolean;
@@ -1033,4 +991,131 @@ export interface VscodeSessionList {
    * 可选：旧后端不返回该字段时为 `undefined`，前端按旧文案处理。
    */
   dataRoot?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// API 反向代理
+// ---------------------------------------------------------------------------
+
+/** 上游 Key（账号库导入的调用凭据）。 */
+export interface ProxyUpstreamKey {
+  key_id: string;
+  api_key: string;
+  label: string;
+  account_id?: string;
+  /** active / exhausted / disabled / rate_limited / cooldown / abnormal */
+  status: string;
+  used_count: number;
+  /** 积分「剩余/总量」 */
+  points: string;
+  points_updated_at?: string;
+  created_at?: string;
+  last_used_at?: string;
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  total_tokens?: number;
+  total_cached_tokens?: number;
+  total_credits?: number;
+}
+
+/** 子 API Key（对外分发的访问凭据）。 */
+export interface ProxySubKey {
+  key_id: string;
+  api_key: string;
+  label: string;
+  is_active: boolean;
+  /** 允许的模型列表，空 = 全部 */
+  allowed_models: string[];
+  /** 允许使用的上游 Key ID，空 = 全部 */
+  allowed_key_ids: string[];
+  /** 最大使用次数，0 = 无限 */
+  max_usage: number;
+  /** Token 累计上限，0 = 不限 */
+  max_tokens?: number;
+  /** 积分消耗累计上限，0 = 不限 */
+  max_credits?: number;
+  used_count: number;
+  rate_limit_rpm: number;
+  /** 1 专一 / 2 临期优先 / 3 轮询 / 4 会话亲和 */
+  key_mode: number;
+  created_at?: string;
+  /** 可调用的上游 Key 剩余积分总和（后端计算）。 */
+  total_points?: number;
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  total_tokens?: number;
+  total_cached_tokens?: number;
+  total_credits?: number;
+}
+
+/** 代理服务设置。 */
+export interface ProxySettings {
+  port: number;
+  /** local（仅本机）/ open（局域网开放，强制子 Key 鉴权） */
+  mode: string;
+  upstream_proxy: string;
+  auto_start: boolean;
+}
+
+/** 代理服务运行状态。 */
+export interface ProxyServerStatus {
+  running: boolean;
+  port: number;
+  mode: string;
+  url?: string;
+  settings: ProxySettings;
+}
+
+/** 可导入为上游 Key 的账号。 */
+export interface ProxyImportableAccount {
+  id: string;
+  uid: string;
+  name: string;
+  variant: string;
+}
+
+/** 代理请求日志条目。 */
+export interface ProxyRequestLog {
+  timestamp: number;
+  sub_key_id?: string;
+  sub_key_label?: string;
+  main_key_id?: string;
+  main_key_label?: string;
+  model?: string;
+  /** request / start / end / error / auth_fail / upstream_error / upstream_429 */
+  event: string;
+  duration_ms?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  first_token_ms?: number;
+  error?: string;
+  upstream_status?: number;
+  request_path?: string;
+}
+
+/** 单个 Key 某一天的统计。 */
+export interface ProxyDailyStat {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  credits: number;
+  count: number;
+}
+
+/** 代理消耗总览。 */
+export interface ProxyOverview {
+  total: {
+    requests: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    tokens: number;
+    cached_tokens: number;
+    credits: number;
+  };
+  today: {
+    requests: number;
+    tokens: number;
+    credits: number;
+  };
 }

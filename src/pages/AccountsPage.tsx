@@ -12,7 +12,6 @@ import {
 import { AccountCard } from "@/components/account-card";
 import { AccountInfoDialog } from "@/components/account-info-dialog";
 import { CodebuddyIdeSwitchAccountDialog } from "@/components/codebuddy-ide-switch-account-dialog";
-import { DemoAction } from "@/components/demo-action";
 import {
   CodeBuddyCnIdeMark,
   WorkBuddyMark,
@@ -283,18 +282,16 @@ export default function AccountsPage() {
       // （macOS 可能等待系统授权、Windows 走 PowerShell，耗时可达数秒），排在状态
       // 前面会让「已接入」迟迟不显示（issue #84）。
       const statuses = refreshClientStatuses();
-      if (!api.isDemoMode()) {
-        if (enabledTools.codebuddyIde) {
-          try {
-            // 国际版探测 CodeBuddy.app 钥匙串；国内版探测 CodeBuddy CN。不要交叉读。
-            if (variantUsesIntlCodebuddyIde(variant)) {
-              await api.detectCodebuddyIdeAccount();
-            } else {
-              await api.detectCodebuddyCnIdeAccount();
-            }
-          } catch {
-            /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
+      if (enabledTools.codebuddyIde) {
+        try {
+          // 国际版探测 CodeBuddy.app 钥匙串；国内版探测 CodeBuddy CN。不要交叉读。
+          if (variantUsesIntlCodebuddyIde(variant)) {
+            await api.detectCodebuddyIdeAccount();
+          } else {
+            await api.detectCodebuddyCnIdeAccount();
           }
+        } catch {
+          /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
         }
       }
       await statuses;
@@ -406,7 +403,6 @@ export default function AccountsPage() {
   // 后端入账 hook 事件（CLI / WorkBuddy 的 429 当轮）后推送 → 立即拉取，秒级更新。
   // 这一路不看节流：新状态已经在后端，前端只做拉取。
   useEffect(() => {
-    if (api.isWebui()) return;
     let unlisten: (() => void) | undefined;
     void listen("rate-limits-updated", () => {
       void loadRateLimitsRef.current({ force: true });
@@ -680,26 +676,20 @@ export default function AccountsPage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
-            <DemoAction>
-              <Button
-                className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
-                onClick={() => setOauthOpen(true)}
-              >
-                <QrCode />OAuth 扫码添加
-              </Button>
-            </DemoAction>
+            <Button
+              className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
+              onClick={() => setOauthOpen(true)}
+            >
+              <QrCode />OAuth 扫码添加
+            </Button>
           </div>
           <div className="flex items-center gap-1">
-            <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setImportOpen(true)} title="从备份文件导入账号">
-                <FileUp />导入备份
-              </Button>
-            </DemoAction>
-            <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
-                <FileDown />导出
-              </Button>
-            </DemoAction>
+            <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setImportOpen(true)} title="从备份文件导入账号">
+              <FileUp />导入备份
+            </Button>
+            <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
+              <FileDown />导出
+            </Button>
           </div>
         </div>
       </div>
@@ -728,21 +718,19 @@ export default function AccountsPage() {
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span>
-                    <DemoAction>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-9 rounded-lg"
-                        disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
-                        onClick={() => void onRefreshCredits()}
-                        aria-label={refreshCreditsLabel}
-                      >
-                        <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
-                      </Button>
-                    </DemoAction>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg"
+                      disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
+                      onClick={() => void onRefreshCredits()}
+                      aria-label={refreshCreditsLabel}
+                    >
+                      <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
+                    </Button>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : refreshCreditsLabel}</TooltipContent>
+                <TooltipContent side="top">{refreshCreditsLabel}</TooltipContent>
               </Tooltip>
             </div>
           </TooltipProvider>

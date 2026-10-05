@@ -21,7 +21,6 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { DemoAction } from "@/components/demo-action";
 import {
   Card,
   CardContent,
@@ -36,6 +35,7 @@ import {
 } from "@/components/ui/chart";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import * as api from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
@@ -1522,7 +1522,7 @@ function loadCachedStatistics(refresh: boolean): Promise<CreditStatistics> {
   });
 }
 
-export default function CreditStatsPage() {
+export default function CreditStatsPage({ embedded = false }: { embedded?: boolean }) {
   const {
     accounts,
     creditMap,
@@ -1569,7 +1569,6 @@ export default function CreditStatsPage() {
     void (async () => {
       // 先渲染本地缓存（后端只读磁盘，不用等网络）
       await load(false);
-      if (api.isDemoMode()) return;
       // 过期只看后端记录的采集时刻：会话内变量每次启动都归零，判断不出
       // 「缓存其实是几小时前采的」，所以刚打开应用时不会自动刷新。
       const collectedAt = cachedStatistics?.officialUsage?.collectedAt ?? 0;
@@ -1592,27 +1591,25 @@ export default function CreditStatsPage() {
   const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
-      <header className="mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12">
+    <div className={embedded ? "min-w-0" : "mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9"}>
+      <header className={cn("flex min-w-0 flex-wrap items-start justify-between gap-4", embedded ? "mb-6" : "mb-10 sm:mb-12")}>
         <div className="min-w-0">
-          <h1 className="text-[28px] font-semibold tracking-tight">积分统计</h1>
+          {embedded ? null : <h1 className="text-[28px] font-semibold tracking-tight">积分统计</h1>}
           <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
             当前数据更新于 {stats ? formatDateTime(official?.collectedAt ?? stats.generatedAt) : "—"}
           </p>
         </div>
         <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
-          <DemoAction>
-            <Button
-              className="shrink-0"
-              variant="outline"
-              size="sm"
-              onClick={() => void load(true)}
-              disabled={loading}
-            >
-              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              刷新统计
-            </Button>
-          </DemoAction>
+          <Button
+            className="shrink-0"
+            variant="outline"
+            size="sm"
+            onClick={() => void load(true)}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            刷新统计
+          </Button>
         </div>
       </header>
 

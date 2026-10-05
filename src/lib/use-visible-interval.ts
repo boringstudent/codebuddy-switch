@@ -1,8 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 
-import * as api from "@/lib/api";
-
 /**
  * 仅在主窗口可见时按间隔执行回调；隐藏时暂停，恢复可见时立即执行一次。
  *
@@ -47,14 +45,12 @@ export function useVisibleInterval(callback: () => void, intervalMs: number, ena
     document.addEventListener("visibilitychange", onVisibility);
 
     let unlisten: (() => void) | undefined;
-    if (!api.isWebui()) {
-      void listen<boolean>("main-window-visible", (event) => {
-        if (event.payload) start();
-        else stop();
-      }).then((fn) => {
-        unlisten = fn;
-      });
-    }
+    void listen<boolean>("main-window-visible", (event) => {
+      if (event.payload) start();
+      else stop();
+    }).then((fn) => {
+      unlisten = fn;
+    });
 
     return () => {
       stop();

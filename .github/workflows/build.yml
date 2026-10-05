@@ -44,7 +44,7 @@ jobs:
                   "update_os": "macos",
                   "update_arch": "aarch64",
                   "update_bundle": "macos",
-                  "update_archive_name": "workbuddy-switch-macos-aarch64.app.tar.gz",
+                  "update_archive_name": "CodeBuddy-macos-aarch64.app.tar.gz",
               },
               {
                   "name": "mac-x64",
@@ -56,7 +56,7 @@ jobs:
                   "update_os": "macos",
                   "update_arch": "x86_64",
                   "update_bundle": "macos",
-                  "update_archive_name": "workbuddy-switch-macos-x86_64.app.tar.gz",
+                  "update_archive_name": "CodeBuddy-macos-x86_64.app.tar.gz",
               },
               {
                   "name": "win-x64",
@@ -68,7 +68,7 @@ jobs:
                   "update_os": "windows",
                   "update_arch": "x86_64",
                   "update_bundle": "nsis",
-                  "update_archive_name": "workbuddy-switch-windows-x86_64-setup.exe",
+                  "update_archive_name": "CodeBuddy-windows-x86_64-setup.exe",
               },
               {
                   "name": "linux-x64",
@@ -80,7 +80,7 @@ jobs:
                   "update_os": "linux",
                   "update_arch": "x86_64",
                   "update_bundle": "appimage",
-                  "update_archive_name": "workbuddy-switch-linux-x86_64.AppImage",
+                  "update_archive_name": "CodeBuddy-linux-x86_64.AppImage",
               },
           ]
           event = os.environ.get("EVENT_NAME", "")
@@ -156,40 +156,12 @@ jobs:
             "dmgbuild==1.6.7"
           echo "$DMGBUILD_VENV/bin" >> "$GITHUB_PATH"
 
-      # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
+      # 前端构建产物（Tauri App 使用）
       - name: Build frontend
         run: |
           npm install
           npm run build
-
-      # CLI 二进制
-      - name: Build server binary
-        shell: bash
-        run: |
-          cargo build -p wb-switch-server --release --target ${{ matrix.target }}
           mkdir -p dist-bin
-
-      # 打包本平台包并发布到 npm（CLI 二进制走 npm registry，Release 只留桌面 App）
-      # 仅 tag 发布；手动触发（例如只打 Windows 试装包）不得 npm publish。
-      # 仓库变量 PUBLISH_NPM=false 时整段跳过：registry 维护/故障期间仍可把桌面 App 发出去，
-      # 恢复后把变量改回 true 重跑本工作流即可补发 npm（脚本幂等，Release 资产会覆盖）。
-      - name: Publish platform package
-        if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPM != 'false'
-        shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
-          # 用 tag 版本同步 platform 包版本（git 里的可能滞后）
-          VER="${GITHUB_REF_NAME#v}"
-          perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
-          mkdir -p "$PKG_DIR/bin"
-          SRC="target/${{ matrix.target }}/release/wb-switch"
-          [ -f "$SRC.exe" ] && SRC="$SRC.exe"
-          cp "$SRC" "$PKG_DIR/bin/${{ matrix.cli_bin }}"
-          cd "$PKG_DIR"
-          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
-          npm publish --access public --registry=https://registry.npmjs.org
 
       # 桌面 App（mac app / nsis exe / deb + AppImage）
       - name: Build desktop app
@@ -210,13 +182,13 @@ jobs:
           echo "bundle after build:"
           find "$BUNDLE_ROOT" -type f | sort || true
           if [ "${{ matrix.bundles }}" = "nsis" ]; then
-            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "workbuddy-switch_${VER}_x64-setup.exe" || true)
+            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "CodeBuddy_${VER}_x64-setup.exe" || true)
             if [ -n "$STALE" ]; then
               echo "error: stale Windows installer still present:" >&2
               printf '%s\n' "$STALE" >&2
               exit 1
             fi
-            test -f "$BUNDLE_ROOT/nsis/workbuddy-switch_${VER}_x64-setup.exe"
+            test -f "$BUNDLE_ROOT/nsis/CodeBuddy_${VER}_x64-setup.exe"
           fi
           find "$BUNDLE_ROOT" -type f \
             \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
@@ -224,8 +196,8 @@ jobs:
             -exec cp {} dist-bin/ \;
           # mac：纯命令行打 dmg（CI 无 Finder，Tauri 自带的 bundle_dmg.sh 会失败）
           if [ "${{ matrix.bundles }}" = "app" ]; then
-            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/workbuddy-switch.app"
-            cp "workbuddy-switch_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
+            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/CodeBuddy.app"
+            cp "CodeBuddy_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
           fi
 
       - name: Generate updater manifest
@@ -260,18 +232,18 @@ jobs:
               echo "error: missing signature for $APPIMAGE or $DEB" >&2
               exit 1
             fi
-            cp "$APPIMAGE" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.AppImage"
-            cp "$APPIMAGE.sig" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.AppImage.sig"
-            cp "$DEB" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.deb"
-            cp "$DEB.sig" "dist-bin/workbuddy-switch-linux-${UPDATE_ARCH}.deb.sig"
+            cp "$APPIMAGE" "dist-bin/CodeBuddy-linux-${UPDATE_ARCH}.AppImage"
+            cp "$APPIMAGE.sig" "dist-bin/CodeBuddy-linux-${UPDATE_ARCH}.AppImage.sig"
+            cp "$DEB" "dist-bin/CodeBuddy-linux-${UPDATE_ARCH}.deb"
+            cp "$DEB.sig" "dist-bin/CodeBuddy-linux-${UPDATE_ARCH}.deb.sig"
             UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=appimage \
               UPDATE_KEYS="linux-${UPDATE_ARCH}-appimage linux-${UPDATE_ARCH}" \
-              UPDATE_ARCHIVE_NAME="workbuddy-switch-linux-${UPDATE_ARCH}.AppImage" \
+              UPDATE_ARCHIVE_NAME="CodeBuddy-linux-${UPDATE_ARCH}.AppImage" \
               UPDATE_JSON_NAME="latest-linux-${UPDATE_ARCH}.json" \
               BUNDLE_DIR="$LINUX_ROOT/appimage" sh scripts/gen-update-json.sh
             UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=deb \
               UPDATE_KEYS="linux-${UPDATE_ARCH}-deb" \
-              UPDATE_ARCHIVE_NAME="workbuddy-switch-linux-${UPDATE_ARCH}.deb" \
+              UPDATE_ARCHIVE_NAME="CodeBuddy-linux-${UPDATE_ARCH}.deb" \
               UPDATE_JSON_NAME="latest-linux-deb-${UPDATE_ARCH}.json" \
               BUNDLE_DIR="$LINUX_ROOT/deb" sh scripts/gen-update-json.sh
             cp "$LINUX_ROOT/appimage/latest-linux-${UPDATE_ARCH}.json" dist-bin/
@@ -279,7 +251,7 @@ jobs:
             exit 0
           fi
           if [ "$UPDATE_OS" = "windows" ]; then
-            ARCHIVE="$BUNDLE_DIR/workbuddy-switch_${VER}_x64-setup.exe"
+            ARCHIVE="$BUNDLE_DIR/CodeBuddy_${VER}_x64-setup.exe"
           else
             ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
             COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -296,7 +268,7 @@ jobs:
           cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
           cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
           if [ "$UPDATE_OS" = "windows" ]; then
-            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/workbuddy-switch_${VER}_x64-setup.exe"
+            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/CodeBuddy_${VER}_x64-setup.exe"
           fi
           UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
           MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
@@ -308,25 +280,6 @@ jobs:
           name: ${{ matrix.name }}
           path: dist-bin/
           if-no-files-found: error
-
-  # 所有平台包发布成功后，发布主包（optionalDependencies 引用平台包）
-  publish-main:
-    name: Publish npm main package
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPM != 'false'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Publish main package
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          cd npm
-          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
-          npm publish --access public --registry=https://registry.npmjs.org
 
   release:
     name: Publish release assets

@@ -1,7 +1,6 @@
 import { toast } from "sonner";
 
 import * as api from "./api";
-import { demoModeEnabled } from "./demo-mode";
 
 /**
  * 应用内通知存档：toast 只存活几秒，事后无法回看；这里把每条提示同步写一份到
@@ -9,7 +8,7 @@ import { demoModeEnabled } from "./demo-mode";
  * 「应用当时到底提示了什么」（例如切号成功/失败的具体文案）。
  *
  * 实现方式：包装 sonner 的 `toast.success/error/warning/info`，既有调用点无需改动；
- * 存档失败静默，提示本身照常显示。演示模式不落盘。
+ * 存档失败静默，提示本身照常显示。
  */
 type Level = "success" | "error" | "warning" | "info";
 
@@ -24,7 +23,7 @@ let installed = false;
 
 /** 安装一次即可；重复调用无副作用。 */
 export function installNotificationArchive(): void {
-  if (installed || demoModeEnabled) return;
+  if (installed) return;
   installed = true;
   for (const level of LEVELS) {
     const original = toast[level].bind(toast) as (
