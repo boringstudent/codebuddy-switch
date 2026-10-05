@@ -9,6 +9,7 @@
 //! - 请求日志与每日统计，JSON 文件持久化（`~/.wb-switch/proxy_db.json`）
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -142,8 +143,14 @@ fn db() -> &'static Mutex<ProxyDb> {
 }
 
 fn lock_db() -> MutexGuard<'static, ProxyDb> {
+    // 先增量折叠账本，再把权威统计回写展示缓存（被其它进程冲掉的累计在这里自愈）。
+    fold_usage_events();
     let mut guard = db().lock().unwrap();
     guard.reload_if_changed();
+    {
+        let fold = usage_fold().lock().unwrap();
+        sync_usage_into_db(&mut guard.data, &fold);
+    }
     guard
 }
 
@@ -170,13 +177,13 @@ fn merge_db_defaults(mut data: Value) -> Value {
 }
 
 impl ProxyDb {
-    /// 文件被其他进程改过时（mtime 变化）先从磁盘重载，再叠加本进程的修改。
+    /// 文件被其他进程改过时（mtime 变化）先收敛重载，再叠加本进程的修改。
     fn reload_if_changed(&mut self) {
         let mtime = db_mtime();
         if mtime.is_some() && mtime != self.loaded_mtime {
             if let Ok(text) = std::fs::read_to_string(proxy_db_file()) {
-                if let Ok(data) = serde_json::from_str::<Value>(&text) {
-                    self.data = merge_db_defaults(data);
+                if let Ok(disk) = serde_json::from_str::<Value>(&text) {
+                    self.data = converge_on_reload(&self.data, &disk);
                 }
             }
             self.loaded_mtime = mtime;
@@ -187,10 +194,184 @@ impl ProxyDb {
         if let Some(parent) = proxy_db_file().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        if let Ok(text) = std::fs::read_to_string(proxy_db_file()) {
+            if let Ok(disk) = serde_json::from_str::<Value>(&text) {
+                self.data = converge_on_save(&self.data, &disk);
+            }
+        }
         let content = serde_json::to_string_pretty(&self.data).unwrap_or_default();
         let _ = atomic_write(&proxy_db_file(), &content);
         // 记录自己写出的文件版本，避免下次锁内把自身写入误判为外部变更。
         self.loaded_mtime = db_mtime();
+    }
+}
+
+/// 重载收敛：磁盘是配置权威（另一实例的增删改据此同步），本进程累计的单调数据
+/// （计数 / Token / 积分 / 每日统计 / 日志）合并进来——不得被旧值整体替换
+/// （2026-10-05 实证：另一实例写盘后本进程积分被冲掉）。
+fn converge_on_reload(ours: &Value, disk: &Value) -> Value {
+    let mut merged = merge_db_defaults(disk.clone());
+    merge_monotonic_fields(&mut merged, ours);
+    merged
+}
+
+/// 写盘收敛：本进程是配置权威，磁盘上的单调累计合并进来（另一实例可能同时在记数）。
+fn converge_on_save(ours: &Value, disk: &Value) -> Value {
+    let mut merged = ours.clone();
+    merge_monotonic_fields(&mut merged, disk);
+    merged
+}
+
+/// 单调递增的 Key 计数字段（合并时取最大）。
+const MONOTONIC_KEY_FIELDS: [&str; 5] = [
+    "used_count",
+    "total_prompt_tokens",
+    "total_completion_tokens",
+    "total_tokens",
+    "total_cached_tokens",
+];
+
+/// 把 `disk` 里的单调累计数据合并进 `ours`（计数取最大、每日统计逐字段取最大、日志按时间并集）。
+///
+/// 只合并**两边都存在**的 Key：不采纳磁盘上多出来的整个 Key（否则会复活本进程刚删除的 Key）；
+/// `daily_stats` 是历史记录、没有删除语义，全部并入。
+fn merge_monotonic_fields(ours: &mut Value, disk: &Value) {
+    for keys_path in ["upstream_keys", "sub_api_keys"] {
+        let Some(disk_keys) = disk.get(keys_path).and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(our_keys) = ours.get_mut(keys_path).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for disk_key in disk_keys {
+            let Some(key_id) = disk_key.get("key_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(our_key) = our_keys.iter_mut().find(|key| {
+                key.get("key_id").and_then(Value::as_str) == Some(key_id)
+            }) else {
+                continue;
+            };
+            for field in MONOTONIC_KEY_FIELDS {
+                let disk_value = disk_key.get(field).and_then(Value::as_f64).unwrap_or(0.0);
+                let our_value = our_key.get(field).and_then(Value::as_f64).unwrap_or(0.0);
+                if disk_value > our_value {
+                    our_key[field] = disk_key.get(field).cloned().unwrap_or(Value::Null);
+                }
+            }
+            for field in ["total_credits", "last_used_at"] {
+                let disk_value = disk_key.get(field).cloned().unwrap_or(Value::Null);
+                let our_value = our_key.get(field).cloned().unwrap_or(Value::Null);
+                let ordering = our_value
+                    .as_str()
+                    .zip(disk_value.as_str())
+                    .map(|(our, disk)| our.cmp(disk))
+                    .or_else(|| {
+                        our_value
+                            .as_f64()
+                            .zip(disk_value.as_f64())
+                            .and_then(|(our, disk)| our.partial_cmp(&disk))
+                    });
+                if ordering.is_some_and(|ordering| ordering.is_lt()) {
+                    our_key[field] = disk_value;
+                }
+            }
+        }
+    }
+    // 每日统计：category → key_id → date → 字段，逐字段取最大。
+    if let Some(disk_stats) = disk.get("daily_stats").and_then(Value::as_object) {
+        let our_stats = ours
+            .as_object_mut()
+            .map(|root| root.entry("daily_stats".to_string()).or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut);
+        if let Some(our_stats) = our_stats {
+            for (category, keys) in disk_stats {
+                let Some(disk_keys) = keys.as_object() else {
+                    continue;
+                };
+                let our_keys = our_stats
+                    .entry(category.clone())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut();
+                let Some(our_keys) = our_keys else {
+                    continue;
+                };
+                for (key_id, dates) in disk_keys {
+                    let Some(disk_dates) = dates.as_object() else {
+                        continue;
+                    };
+                    let our_dates = our_keys
+                        .entry(key_id.clone())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut();
+                    let Some(our_dates) = our_dates else {
+                        continue;
+                    };
+                    for (date, disk_day) in disk_dates {
+                        let our_day = our_dates
+                            .entry(date.clone())
+                            .or_insert_with(|| json!({}));
+                        let (Some(our_day), Some(disk_day)) =
+                            (our_day.as_object_mut(), disk_day.as_object())
+                        else {
+                            continue;
+                        };
+                        for (field, disk_value) in disk_day {
+                            let disk_num = disk_value.as_f64().unwrap_or(0.0);
+                            let our_num = our_day
+                                .get(field)
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            if disk_num > our_num {
+                                our_day.insert(field.clone(), disk_value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 请求日志：清空墓碑 `logs_cleared_at` 取双方较大者，早于它的条目先滤掉
+    // （否则「清空日志」会被另一进程持有的旧日志经合并带回来，2026-10-05 实证清空按钮失效），
+    // 剩余条目按内容去重取并集、按时间排序后保留最新 1000 条。
+    let cleared_marker = ours
+        .get("logs_cleared_at")
+        .and_then(Value::as_f64)
+        .into_iter()
+        .chain(disk.get("logs_cleared_at").and_then(Value::as_f64))
+        .fold(0.0_f64, f64::max);
+    let keep_entry = |entry: &Value| {
+        entry.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0) > cleared_marker
+    };
+    if let Some(our_logs) = ours.get_mut("request_logs").and_then(Value::as_array_mut) {
+        our_logs.retain(keep_entry);
+    }
+    let our_logs = ours
+        .as_object_mut()
+        .map(|root| root.entry("request_logs".to_string()).or_insert_with(|| json!([])))
+        .and_then(Value::as_array_mut);
+    if let Some(our_logs) = our_logs {
+        let mut seen: std::collections::HashSet<String> =
+            our_logs.iter().map(|entry| entry.to_string()).collect();
+        if let Some(disk_logs) = disk.get("request_logs").and_then(Value::as_array) {
+            for entry in disk_logs {
+                if keep_entry(entry) && seen.insert(entry.to_string()) {
+                    our_logs.push(entry.clone());
+                }
+            }
+        }
+        our_logs.sort_by(|left, right| {
+            let left_ts = left.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0);
+            let right_ts = right.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0);
+            left_ts.partial_cmp(&right_ts).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if our_logs.len() > REQUEST_LOG_KEEP {
+            let overflow = our_logs.len() - REQUEST_LOG_KEEP;
+            our_logs.drain(..overflow);
+        }
+    }
+    if cleared_marker > 0.0 {
+        ours["logs_cleared_at"] = json!(cleared_marker);
     }
 }
 
@@ -357,6 +538,8 @@ pub fn request_logs(since: f64, limit: usize) -> Vec<Value> {
 pub fn clear_request_logs() {
     let mut db = lock_db();
     db.data["request_logs"] = json!([]);
+    // 清空墓碑：并发合并时早于该时刻的日志不得再被带回来（见 merge_monotonic_fields）。
+    db.data["logs_cleared_at"] = json!(now_secs());
     db.save();
 }
 
@@ -391,70 +574,103 @@ pub fn daily_stats(category: &str, key_id: &str) -> Value {
 }
 
 /// 代理消耗总览：累计 + 今日的 Token / 积分 / 调用数（上游 Key 池口径）。
+///
+/// 口径以 `daily_stats` 的**全量历史**为准（含已删除的上游 Key）：删除 Key 只移除凭据，
+/// 不得把它的历史消耗从总览里抹掉——否则总览的「今日积分 / Token」会在删 Key 后回退
+/// （2026-10-05 用户实证）。无 daily 记录的存量 Key 回退取 Key 自身的累计字段。
 pub fn proxy_overview() -> Value {
     let upstream = list_upstream_keys();
     let today = today_str();
     let db = lock_db();
-    let today_field = |key_id: &str, field: &str| -> f64 {
-        db.data
-            .pointer(&format!("/daily_stats/upstream/{key_id}/{today}/{field}"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-    };
-    let mut today_requests = 0.0;
-    let mut today_tokens = 0.0;
-    let mut today_credits = 0.0;
-    let mut total_requests = 0.0;
-    let mut total_prompt = 0.0;
-    let mut total_completion = 0.0;
-    let mut total_tokens = 0.0;
-    let mut total_cached = 0.0;
-    let mut total_credits = 0.0;
-    for key in &upstream {
-        let key_id = key
-            .get("key_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        today_requests += today_field(key_id, "count");
-        today_tokens += today_field(key_id, "total_tokens");
-        today_credits += today_field(key_id, "credits");
-        total_requests += key.get("used_count").and_then(Value::as_f64).unwrap_or(0.0);
-        total_prompt += key
-            .get("total_prompt_tokens")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        total_completion += key
-            .get("total_completion_tokens")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        total_tokens += key
-            .get("total_tokens")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        total_cached += key
-            .get("total_cached_tokens")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        total_credits += key
-            .get("total_credits")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+    let daily = db
+        .data
+        .pointer("/daily_stats/upstream")
+        .cloned()
+        .unwrap_or(json!({}));
+    let mut totals = sum_daily_stats(&daily, &today);
+    // 兼容没有 daily 记录的存量 Key（例如统计功能上线前就有累计字段的数据）。
+    if let Some(keys) = daily.as_object() {
+        for key in &upstream {
+            let key_id = key.get("key_id").and_then(Value::as_str).unwrap_or_default();
+            if keys.contains_key(key_id) {
+                continue;
+            }
+            totals.requests += key.get("used_count").and_then(Value::as_f64).unwrap_or(0.0);
+            totals.prompt += key.get("total_prompt_tokens").and_then(Value::as_f64).unwrap_or(0.0);
+            totals.completion += key
+                .get("total_completion_tokens")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            totals.tokens += key.get("total_tokens").and_then(Value::as_f64).unwrap_or(0.0);
+            totals.cached += key
+                .get("total_cached_tokens")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            totals.credits += key.get("total_credits").and_then(Value::as_f64).unwrap_or(0.0);
+        }
     }
     json!({
         "total": {
-            "requests": total_requests,
-            "prompt_tokens": total_prompt,
-            "completion_tokens": total_completion,
-            "tokens": total_tokens,
-            "cached_tokens": total_cached,
-            "credits": total_credits,
+            "requests": totals.requests,
+            "prompt_tokens": totals.prompt,
+            "completion_tokens": totals.completion,
+            "tokens": totals.tokens,
+            "cached_tokens": totals.cached,
+            "credits": totals.credits,
         },
         "today": {
-            "requests": today_requests,
-            "tokens": today_tokens,
-            "credits": today_credits,
+            "requests": totals.today_requests,
+            "tokens": totals.today_tokens,
+            "credits": totals.today_credits,
         },
     })
+}
+
+/// daily_stats 汇总累加器（总览用）。
+#[derive(Default)]
+struct DailyTotals {
+    requests: f64,
+    prompt: f64,
+    completion: f64,
+    tokens: f64,
+    cached: f64,
+    credits: f64,
+    today_requests: f64,
+    today_tokens: f64,
+    today_credits: f64,
+}
+
+/// 汇总 `daily_stats/upstream` 全量历史（含已删除 Key 的记录），并单独累计「今日」。
+fn sum_daily_stats(daily: &Value, today: &str) -> DailyTotals {
+    let mut totals = DailyTotals::default();
+    if let Some(keys) = daily.as_object() {
+        for days in keys.values().filter_map(Value::as_object) {
+            for (date, day) in days {
+                totals.add(day, date == today);
+            }
+        }
+    }
+    totals
+}
+
+impl DailyTotals {
+    fn add(&mut self, day: &Value, is_today: bool) {
+        let field = |name: &str| day.get(name).and_then(Value::as_f64).unwrap_or(0.0);
+        let count = field("count");
+        let tokens = field("total_tokens");
+        let credits = field("credits");
+        self.requests += count;
+        self.prompt += field("prompt_tokens");
+        self.completion += field("completion_tokens");
+        self.tokens += tokens;
+        self.cached += field("cached_tokens");
+        self.credits += credits;
+        if is_today {
+            self.today_requests += count;
+            self.today_tokens += tokens;
+            self.today_credits += credits;
+        }
+    }
 }
 
 /// 一次请求结束的完整入账（上游 Key + 子 Key + 每日统计 + 日志），一次锁一次写盘。
@@ -469,24 +685,21 @@ fn record_request_end(
     duration_ms: u64,
     first_token_ms: u64,
 ) {
-    let prompt = usage
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let completion = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .get("cached_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let credit = usage.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+    let (prompt, completion, total, cached, credit) = usage_numbers(usage);
+
+    // 事件溯源：先记账本（权威来源），再更新 proxy_db 展示缓存（被冲掉可自愈）。
+    append_usage_event(&json!({
+        "type": "end",
+        "ts": now_secs(),
+        "date": today_str(),
+        "upstream": upstream_key_id,
+        "sub": sub_key_id,
+        "prompt": prompt,
+        "completion": completion,
+        "total": total,
+        "cached": cached,
+        "credit": credit,
+    }));
 
     let mut db = lock_db();
     let today = today_str();
@@ -573,9 +786,451 @@ fn record_request_end(
             "duration_ms": duration_ms,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
+            "credit": (credit * 10000.0).round() / 10000.0,
             "first_token_ms": first_token_ms,
         }),
     );
+    db.save();
+}
+
+/// 该厂商接口常把数字序列化成字符串（billing 接口的 `"credit": "1.25"`、`"total": "3000"`），
+/// SSE 的 usage 同样出现字符串数字：一律按「数值或数字字符串」解析，否则积分 / Token 会被记成 0，
+/// 子 Key 的积分上限与 Token 上限因此永不触发（2026-10-05 本机实证：356 次请求只记到 0.35 积分）。
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(_) => value.and_then(Value::as_u64),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(_) => value.and_then(Value::as_f64),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// 从 SSE 的 usage 对象提取（prompt, completion, total, cached, credit）。
+///
+/// 全部字段容忍数字字符串；`total_tokens` 缺失 / 为 0 时用 prompt + completion 兜底，
+/// 否则子 Key 的 Token 上限会随「没记上」而永不触发。
+fn usage_numbers(usage: &Value) -> (u64, u64, u64, u64, f64) {
+    let prompt = json_u64(usage.get("prompt_tokens")).unwrap_or(0);
+    let completion = json_u64(usage.get("completion_tokens")).unwrap_or(0);
+    let total = json_u64(usage.get("total_tokens"))
+        .filter(|total| *total > 0)
+        .unwrap_or(prompt + completion);
+    let cached = json_u64(usage.get("cached_tokens"))
+        .or_else(|| json_u64(usage.get("prompt_cache_hit_tokens")))
+        .unwrap_or(0);
+    let credit = json_f64(usage.get("credit")).unwrap_or(0.0);
+    (prompt, completion, total, cached, credit)
+}
+
+// ---------------------------------------------------------------------------
+// 用量事件账本（次数 / Token / 积分的权威来源）
+// ---------------------------------------------------------------------------
+//
+// 设计动因（2026-10-05 连续实证）：proxy_db.json 的累计字段是整文件读-改-写，
+// 任何持有旧内存的进程（旧版本 / 第二实例）写盘都会把它们冲掉；本机系统时钟还会跳变
+// （日志时间戳与 mtime 对不上）。因此次数 / Token / 积分改为**事件溯源**：
+// `proxy_usage.jsonl` 首行是基线快照（迁移存量），之后逐请求追加一行；
+// 权威统计 = 折叠全量事件，proxy_db.json 的累计字段只是折叠结果的展示缓存，
+// 被其它进程冲掉后下一次读取自动重建（自愈）。事件是单行小写追加，
+// 多实例并发只会并集增长，永不互相覆盖。
+
+const USAGE_EVENTS_FILE: &str = "proxy_usage.jsonl";
+
+/// 单个 Key（或单日）的折叠累计值。
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct KeyFold {
+    used: u64,
+    prompt: u64,
+    completion: u64,
+    total: u64,
+    cached: u64,
+    credits: f64,
+}
+
+impl KeyFold {
+    fn add(&mut self, prompt: u64, completion: u64, total: u64, cached: u64, credit: f64) {
+        self.used += 1;
+        self.prompt += prompt;
+        self.completion += completion;
+        self.total += total;
+        self.cached += cached;
+        self.credits += credit;
+    }
+
+    fn from_json(value: &Value) -> KeyFold {
+        KeyFold {
+            used: json_u64(value.get("used")).unwrap_or(0),
+            prompt: json_u64(value.get("prompt")).unwrap_or(0),
+            completion: json_u64(value.get("completion")).unwrap_or(0),
+            total: json_u64(value.get("total")).unwrap_or(0),
+            cached: json_u64(value.get("cached")).unwrap_or(0),
+            credits: json_f64(value.get("credits")).unwrap_or(0.0),
+        }
+    }
+
+    /// 逐字段取最大（并入基线快照用，重复基线不会叠加）。
+    fn merge_max(&mut self, other: &KeyFold) {
+        self.used = self.used.max(other.used);
+        self.prompt = self.prompt.max(other.prompt);
+        self.completion = self.completion.max(other.completion);
+        self.total = self.total.max(other.total);
+        self.cached = self.cached.max(other.cached);
+        self.credits = self.credits.max(other.credits);
+    }
+}
+
+/// 账本的折叠状态（进程内缓存，按已读长度增量推进）。
+#[derive(Default)]
+struct UsageFold {
+    folded_len: u64,
+    upstream: HashMap<String, KeyFold>,
+    sub: HashMap<String, KeyFold>,
+    /// (key_id, date) → 当日累计。
+    daily_upstream: HashMap<(String, String), KeyFold>,
+    daily_sub: HashMap<(String, String), KeyFold>,
+    /// (是否上游, key_id) → 清零时刻；不晚于它的该 Key 事件不计入。
+    reset_floor: HashMap<(bool, String), f64>,
+    /// 账本文件是否存在（不存在时 sync 不动 proxy_db 缓存，回退到旧计数口径）。
+    ledger_present: bool,
+}
+
+static USAGE_FOLD: OnceLock<Mutex<UsageFold>> = OnceLock::new();
+
+fn usage_fold() -> &'static Mutex<UsageFold> {
+    USAGE_FOLD.get_or_init(|| Mutex::new(UsageFold::default()))
+}
+
+fn usage_events_path() -> PathBuf {
+    store_dir().join(USAGE_EVENTS_FILE)
+}
+
+/// 切出完整行（到最后一个换行为止）；半行留给下一轮。
+fn complete_json_lines(bytes: &[u8]) -> (Vec<String>, u64) {
+    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return (Vec::new(), 0);
+    };
+    let text = String::from_utf8_lossy(&bytes[..last_newline]).into_owned();
+    let lines = text
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    (lines, (last_newline + 1) as u64)
+}
+
+/// 折叠一行账本事件（纯函数）。
+fn fold_line(fold: &mut UsageFold, line: &str) {
+    let Ok(entry) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    match entry.get("type").and_then(Value::as_str) {
+        Some("baseline") => {
+            for (is_upstream, scope) in [(true, "upstream"), (false, "sub")] {
+                if let Some(keys) = entry.get(scope).and_then(Value::as_object) {
+                    for (key_id, totals) in keys {
+                        let target = if is_upstream {
+                            &mut fold.upstream
+                        } else {
+                            &mut fold.sub
+                        };
+                        target
+                            .entry(key_id.clone())
+                            .or_default()
+                            .merge_max(&KeyFold::from_json(totals));
+                    }
+                }
+                let daily_scope = if is_upstream {
+                    "daily_upstream"
+                } else {
+                    "daily_sub"
+                };
+                if let Some(days) = entry.get(daily_scope).and_then(Value::as_object) {
+                    for (compound, totals) in days {
+                        let Some((key_id, date)) = compound.split_once('|') else {
+                            continue;
+                        };
+                        let target = if is_upstream {
+                            &mut fold.daily_upstream
+                        } else {
+                            &mut fold.daily_sub
+                        };
+                        target
+                            .entry((key_id.to_string(), date.to_string()))
+                            .or_default()
+                            .merge_max(&KeyFold::from_json(totals));
+                    }
+                }
+            }
+        }
+        Some("reset") => {
+            let Some(key_id) = entry.get("key_id").and_then(Value::as_str) else {
+                return;
+            };
+            let is_upstream = entry.get("scope").and_then(Value::as_str) == Some("upstream");
+            let ts = json_f64(entry.get("ts")).unwrap_or(0.0);
+            let (keys, daily) = if is_upstream {
+                (&mut fold.upstream, &mut fold.daily_upstream)
+            } else {
+                (&mut fold.sub, &mut fold.daily_sub)
+            };
+            keys.remove(key_id);
+            daily.retain(|(id, _), _| id != key_id);
+            fold.reset_floor
+                .insert((is_upstream, key_id.to_string()), ts);
+        }
+        Some("end") => {
+            let ts = json_f64(entry.get("ts")).unwrap_or(0.0);
+            let prompt = json_u64(entry.get("prompt")).unwrap_or(0);
+            let completion = json_u64(entry.get("completion")).unwrap_or(0);
+            let total = json_u64(entry.get("total"))
+                .filter(|total| *total > 0)
+                .unwrap_or(prompt + completion);
+            let cached = json_u64(entry.get("cached")).unwrap_or(0);
+            let credit = json_f64(entry.get("credit")).unwrap_or(0.0);
+            let date = entry
+                .get("date")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            for (is_upstream, field) in [(true, "upstream"), (false, "sub")] {
+                let Some(key_id) = entry.get(field).and_then(Value::as_str) else {
+                    continue;
+                };
+                if key_id.is_empty() || key_id == "_passthrough_" {
+                    continue;
+                }
+                let floor = fold
+                    .reset_floor
+                    .get(&(is_upstream, key_id.to_string()))
+                    .copied()
+                    .unwrap_or(0.0);
+                if ts <= floor {
+                    continue;
+                }
+                let (keys, daily) = if is_upstream {
+                    (&mut fold.upstream, &mut fold.daily_upstream)
+                } else {
+                    (&mut fold.sub, &mut fold.daily_sub)
+                };
+                keys.entry(key_id.to_string())
+                    .or_default()
+                    .add(prompt, completion, total, cached, credit);
+                if !date.is_empty() {
+                    daily
+                        .entry((key_id.to_string(), date.clone()))
+                        .or_default()
+                        .add(prompt, completion, total, cached, credit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 增量折叠账本（只读新增字节；文件被外部截短 / 替换时全量重折）。
+fn fold_usage_events() {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = usage_events_path();
+    let mut fold = usage_fold().lock().unwrap();
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return;
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if len < fold.folded_len {
+        *fold = UsageFold::default();
+    }
+    fold.ledger_present = true;
+    if len == fold.folded_len {
+        return;
+    }
+    if file.seek(SeekFrom::Start(fold.folded_len)).is_err() {
+        return;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return;
+    }
+    let (lines, consumed) = complete_json_lines(&tail);
+    for line in lines {
+        fold_line(&mut fold, &line);
+    }
+    fold.folded_len += consumed;
+}
+
+/// 迁移基线：proxy_db.json 现有累计 → 账本首行（折叠值因此始终 ≥ 历史值）。
+fn usage_baseline() -> Value {
+    let disk = std::fs::read_to_string(proxy_db_file())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or(json!({}));
+    let key_totals = |keys_path: &str| -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        if let Some(keys) = disk.get(keys_path).and_then(Value::as_array) {
+            for key in keys {
+                let Some(key_id) = key.get("key_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                map.insert(
+                    key_id.to_string(),
+                    json!({
+                        "used": key.get("used_count").and_then(Value::as_u64).unwrap_or(0),
+                        "prompt": key.get("total_prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "completion": key.get("total_completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "total": key.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "cached": key.get("total_cached_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "credits": key.get("total_credits").and_then(Value::as_f64).unwrap_or(0.0),
+                    }),
+                );
+            }
+        }
+        map
+    };
+    let daily_totals = |category: &str| -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        if let Some(keys) = disk
+            .pointer(&format!("/daily_stats/{category}"))
+            .and_then(Value::as_object)
+        {
+            for (key_id, dates) in keys {
+                let Some(dates) = dates.as_object() else {
+                    continue;
+                };
+                for (date, day) in dates {
+                    map.insert(
+                        format!("{key_id}|{date}"),
+                        json!({
+                            "used": day.get("count").and_then(Value::as_u64).unwrap_or(0),
+                            "prompt": day.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            "completion": day.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            "total": day.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            "cached": day.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            "credits": day.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
+                        }),
+                    );
+                }
+            }
+        }
+        map
+    };
+    json!({
+        "type": "baseline",
+        "ts": now_secs(),
+        "upstream": Value::Object(key_totals("upstream_keys")),
+        "sub": Value::Object(key_totals("sub_api_keys")),
+        "daily_upstream": Value::Object(daily_totals("upstream")),
+        "daily_sub": Value::Object(daily_totals("sub")),
+    })
+}
+
+/// 追加一条账本事件；文件不存在时先落基线快照（存量累计并入账本）。
+fn append_usage_event(entry: &Value) {
+    let path = usage_events_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !path.exists() {
+        // create_new：并发进程同时首写时只有一个落基线，另一个直接追加（基线等价，无害）。
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            let _ = std::io::Write::write_all(
+                &mut file,
+                format!("{}\n", usage_baseline()).as_bytes(),
+            );
+        }
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
+        let _ = std::io::Write::write_all(&mut file, format!("{entry}\n").as_bytes());
+    }
+}
+
+/// 把折叠结果写回 proxy_db 的展示缓存（计数 / 每日统计）。
+///
+/// 账本存在时权威覆盖：其它进程把 proxy_db.json 的累计字段冲掉后，
+/// 下一次读取即按账本自愈（2026-10-05 实证反复被旧实例覆写）。
+fn sync_usage_into_db(data: &mut Value, fold: &UsageFold) {
+    if !fold.ledger_present {
+        return;
+    }
+    for (is_upstream, keys_path) in [(true, "upstream_keys"), (false, "sub_api_keys")] {
+        let Some(keys) = data.get_mut(keys_path).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let folds = if is_upstream {
+            &fold.upstream
+        } else {
+            &fold.sub
+        };
+        for key in keys.iter_mut() {
+            let Some(key_id) = key.get("key_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(totals) = folds.get(key_id) else {
+                continue;
+            };
+            key["used_count"] = json!(totals.used);
+            key["total_prompt_tokens"] = json!(totals.prompt);
+            key["total_completion_tokens"] = json!(totals.completion);
+            key["total_tokens"] = json!(totals.total);
+            key["total_cached_tokens"] = json!(totals.cached);
+            key["total_credits"] = json!((totals.credits * 10000.0).round() / 10000.0);
+        }
+    }
+    let daily_stats = data
+        .as_object_mut()
+        .map(|root| {
+            root.entry("daily_stats".to_string())
+                .or_insert_with(|| json!({}))
+        })
+        .and_then(Value::as_object_mut);
+    if let Some(daily_stats) = daily_stats {
+        for (is_upstream, category) in [(true, "upstream"), (false, "sub")] {
+            let folds = if is_upstream {
+                &fold.daily_upstream
+            } else {
+                &fold.daily_sub
+            };
+            let mut by_key = serde_json::Map::new();
+            for ((key_id, date), totals) in folds {
+                let day = by_key
+                    .entry(key_id.clone())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut();
+                if let Some(day) = day {
+                    day.insert(
+                        date.clone(),
+                        json!({
+                            "prompt_tokens": totals.prompt,
+                            "completion_tokens": totals.completion,
+                            "total_tokens": totals.total,
+                            "cached_tokens": totals.cached,
+                            "credits": (totals.credits * 10000.0).round() / 10000.0,
+                            "count": totals.used,
+                        }),
+                    );
+                }
+            }
+            daily_stats.insert(category.to_string(), Value::Object(by_key));
+        }
+    }
+}
+
+/// 清零一个子 Key 的累计用量（次数 / Token / 积分）：账本落清零标记，
+/// 不晚于该时刻的该 Key 事件不再计入；限额检查随下一次读取回到零基线。
+pub fn reset_sub_key_usage(key_id: &str) {
+    append_usage_event(
+        &json!({"type": "reset", "scope": "sub", "key_id": key_id, "ts": now_secs()}),
+    );
+    let mut db = lock_db();
     db.save();
 }
 
@@ -932,6 +1587,29 @@ struct RuntimeState {
     cooldown_counts: Mutex<HashMap<String, u32>>,
     /// key_id → 上次积分查询 epoch 秒（限频）。
     points_query_stamps: Mutex<HashMap<String, u64>>,
+    /// sub_key_id → (分钟窗口, 窗口内已放行请求数)，子 Key RPM 限流。
+    rpm_windows: Mutex<HashMap<String, (u64, u64)>>,
+}
+
+/// 固定分钟窗口的 RPM 限流：`true` = 放行（并已计数），`false` = 本分钟额度已用完。
+///
+/// `rpm == 0` 视为不限（兼容旧数据）；窗口按 epoch 分钟切换即重置。
+fn rpm_allow(windows: &mut HashMap<String, (u64, u64)>, sub_key_id: &str, rpm: u64, now: u64) -> bool {
+    if rpm == 0 {
+        return true;
+    }
+    let window = now / 60;
+    let entry = windows
+        .entry(sub_key_id.to_string())
+        .or_insert((window, 0));
+    if entry.0 != window {
+        *entry = (window, 0);
+    }
+    if entry.1 >= rpm {
+        return false;
+    }
+    entry.1 += 1;
+    true
 }
 
 #[derive(Clone)]
@@ -1442,7 +2120,8 @@ impl UsageScan {
                 continue;
             };
             if let Some(usage) = chunk_json.get("usage") {
-                if usage.get("prompt_tokens").and_then(Value::as_u64).is_some() {
+                // 门槛同样容忍字符串数字：否则整个 usage 对象被丢弃，Token / 积分一并漏记。
+                if json_u64(usage.get("prompt_tokens")).is_some() {
                     self.usage = usage.clone();
                 }
             }
@@ -1474,6 +2153,63 @@ fn detect_stream_error(text: &str) -> Option<&'static str> {
 
 const CONTEXT_TOO_LONG_MESSAGE: &str = "当前对话上下文过长，超出模型限制。请新开一个对话继续。";
 
+// ---------------------------------------------------------------------------
+// 子 Key 限额（次数 / Token / 积分）
+// ---------------------------------------------------------------------------
+
+/// 子 Key 累计用量的超限判定结果。
+///
+/// 三个维度同一结构：`max_* <= 0` 视为不限，已用量**达到**上限即拒绝；
+/// 判定顺序固定为 次数 → Token → 积分，命中即返回，429 文案与既有客户端约定一致。
+#[derive(Debug, PartialEq)]
+enum SubKeyLimit {
+    Usage { used: u64, max: u64 },
+    Tokens { used: u64, max: u64 },
+    Credits { used: f64, max: f64 },
+}
+
+impl SubKeyLimit {
+    fn message(&self) -> &'static str {
+        match self {
+            SubKeyLimit::Usage { .. } => "Usage limit exceeded",
+            SubKeyLimit::Tokens { .. } => "Token limit exceeded",
+            SubKeyLimit::Credits { .. } => "Credit limit exceeded",
+        }
+    }
+}
+
+/// 累计限额检查（纯函数）：次数（`used_count` / `max_usage`）→ Token（`total_tokens` /
+/// `max_tokens`）→ 积分（`total_credits` / `max_credits`），全部维度未超限返回 `None`。
+fn check_sub_key_limits(sub_key: &Value) -> Option<SubKeyLimit> {
+    let u64_of = |field: &str| sub_key.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let max_usage = u64_of("max_usage");
+    let used = u64_of("used_count");
+    if max_usage > 0 && used >= max_usage {
+        return Some(SubKeyLimit::Usage {
+            used,
+            max: max_usage,
+        });
+    }
+    let max_tokens = u64_of("max_tokens");
+    let used_tokens = u64_of("total_tokens");
+    if max_tokens > 0 && used_tokens >= max_tokens {
+        return Some(SubKeyLimit::Tokens {
+            used: used_tokens,
+            max: max_tokens,
+        });
+    }
+    let f64_of = |field: &str| sub_key.get(field).and_then(Value::as_f64).unwrap_or(0.0);
+    let max_credits = f64_of("max_credits");
+    let used_credits = f64_of("total_credits");
+    if max_credits > 0.0 && used_credits >= max_credits {
+        return Some(SubKeyLimit::Credits {
+            used: used_credits,
+            max: max_credits,
+        });
+    }
+    None
+}
+
 async fn chat_completions_handler(
     State(state): State<ProxyState>,
     headers: HeaderMap,
@@ -1503,50 +2239,33 @@ async fn chat_completions_handler(
 
     let is_passthrough = sub_key.get("key_id").and_then(Value::as_str) == Some("_passthrough_");
 
-    // 2. 子 Key 状态与用量上限（透传模式跳过）。
+    // 2. 子 Key 状态与用量上限（透传模式跳过）：次数 → Token → 积分，见 check_sub_key_limits。
     if !is_passthrough {
-        let max_usage = sub_key
-            .get("max_usage")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let used = sub_key
-            .get("used_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if max_usage > 0 && used >= max_usage {
+        if let Some(limit) = check_sub_key_limits(&sub_key) {
             return json_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                json!({"error": {"message": "Usage limit exceeded", "type": "rate_limit"}}),
+                json!({"error": {"message": limit.message(), "type": "rate_limit"}}),
             );
         }
-        // Token 上限（累计 total_tokens，0 = 不限）。
-        let max_tokens = sub_key
-            .get("max_tokens")
+        // RPM 限流（每分钟固定窗口，0 = 不限）。
+        let rpm = sub_key
+            .get("rate_limit_rpm")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let used_tokens = sub_key
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if max_tokens > 0 && used_tokens >= max_tokens {
+        let sub_key_id = sub_key
+            .get("key_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let allowed = rpm_allow(
+            &mut state.runtime.rpm_windows.lock().unwrap(),
+            sub_key_id,
+            rpm,
+            now_secs() as u64,
+        );
+        if !allowed {
             return json_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                json!({"error": {"message": "Token limit exceeded", "type": "rate_limit"}}),
-            );
-        }
-        // 积分上限（累计 total_credits，0 = 不限）。
-        let max_credits = sub_key
-            .get("max_credits")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let used_credits = sub_key
-            .get("total_credits")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if max_credits > 0.0 && used_credits >= max_credits {
-            return json_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                json!({"error": {"message": "Credit limit exceeded", "type": "rate_limit"}}),
+                json!({"error": {"message": format!("Rate limit exceeded ({rpm} rpm)"), "type": "rate_limit"}}),
             );
         }
     }
@@ -2210,4 +2929,388 @@ pub fn total_points_for_sub_key(allowed_key_ids: &[String]) -> f64 {
                 .and_then(|p| p.split('/').next()?.trim().parse::<f64>().ok())
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 该厂商接口常把数字序列化成字符串：解析必须两种形态都收，
+    /// 否则积分 / Token 记成 0，子 Key 上限永不触发（2026-10-05 本机实证）。
+    #[test]
+    fn json_numbers_accept_both_numeric_and_string_forms() {
+        assert_eq!(json_u64(Some(&json!(123))), Some(123));
+        assert_eq!(json_u64(Some(&json!("123"))), Some(123));
+        assert_eq!(json_u64(Some(&json!(" 123 "))), Some(123));
+        assert_eq!(json_u64(Some(&json!("12.3"))), None);
+        assert_eq!(json_u64(Some(&json!("abc"))), None);
+        assert_eq!(json_u64(Some(&json!(true))), None);
+        assert_eq!(json_u64(None), None);
+
+        assert_eq!(json_f64(Some(&json!(1.5))), Some(1.5));
+        assert_eq!(json_f64(Some(&json!(2))), Some(2.0));
+        assert_eq!(json_f64(Some(&json!("1.25"))), Some(1.25));
+        assert_eq!(json_f64(Some(&json!("abc"))), None);
+        assert_eq!(json_f64(None), None);
+    }
+
+    /// usage 全字段字符串形态时仍须完整入账；total 缺失 / 为 0 时用 prompt + completion 兜底。
+    #[test]
+    fn usage_numbers_tolerate_string_fields_and_backfill_the_total() {
+        let usage = json!({
+            "prompt_tokens": "100",
+            "completion_tokens": "50",
+            "total_tokens": "150",
+            "cached_tokens": "20",
+            "credit": "1.25",
+        });
+        assert_eq!(usage_numbers(&usage), (100, 50, 150, 20, 1.25));
+
+        // 缺 total_tokens / total_tokens 为 0 → prompt + completion。
+        let usage = json!({"prompt_tokens": 100, "completion_tokens": 50});
+        assert_eq!(usage_numbers(&usage).2, 150);
+        let usage = json!({"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 0});
+        assert_eq!(usage_numbers(&usage).2, 150);
+
+        // credit 缺失 → 0；cached 兼容 prompt_cache_hit_tokens。
+        let usage = json!({"prompt_tokens": 1, "prompt_cache_hit_tokens": 1});
+        assert_eq!(usage_numbers(&usage), (1, 0, 1, 1, 0.0));
+    }
+
+    /// usage 采纳门槛同样容忍字符串数字：否则整个 usage 对象被丢弃，Token / 积分一并漏记。
+    #[test]
+    fn usage_scan_accepts_usage_chunks_with_string_typed_numbers() {
+        let mut scan = UsageScan::new();
+        scan.feed("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"100\",\"completion_tokens\":\"50\",\"total_tokens\":\"150\",\"credit\":\"0.5\"}}\n\n");
+        assert_eq!(
+            usage_numbers(&scan.usage),
+            (100, 50, 150, 0, 0.5),
+            "字符串形态的 usage 不得被整条丢弃"
+        );
+
+        // data 行被 TCP 分包截断时靠 tail 拼接，仍须采纳入账。
+        let mut scan = UsageScan::new();
+        scan.feed("data: {\"usage\":{\"prompt_to");
+        scan.feed("kens\": 7, \"completion_tokens\": 3}}\n");
+        assert_eq!(usage_numbers(&scan.usage).0, 7);
+
+        // 没有 prompt_tokens 的 usage（如 null 占位）不采纳。
+        let mut scan = UsageScan::new();
+        scan.feed("data: {\"usage\":null}\ndata: [DONE]\n");
+        assert!(scan.usage.is_null());
+    }
+
+    /// 总览以 daily_stats 全量历史为准：已删除 Key（daily 里没有对应上游 Key）的消耗
+    /// 仍计入累计与今日，不得回退（2026-10-05 用户实证「今日积分消耗回退」）。
+    #[test]
+    fn daily_summary_counts_deleted_keys_and_splits_today() {
+        let daily = json!({
+            "ck_alive": {
+                "2026-10-05": {"count": 2, "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "cached_tokens": 10, "credits": 1.5},
+                "2026-10-04": {"count": 1, "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cached_tokens": 0, "credits": 0.5}
+            },
+            // 已删除的 Key：记录必须仍被计入。
+            "ck_deleted": {
+                "2026-10-05": {"count": 3, "prompt_tokens": 300, "completion_tokens": 60, "total_tokens": 360, "cached_tokens": 0, "credits": 2.0}
+            }
+        });
+        let totals = sum_daily_stats(&daily, "2026-10-05");
+        assert_eq!(totals.requests, 6.0);
+        assert_eq!(totals.tokens, 525.0);
+        assert_eq!(totals.credits, 4.0);
+        assert_eq!(totals.prompt, 410.0);
+        assert_eq!(totals.completion, 115.0);
+        assert_eq!(totals.cached, 10.0);
+        assert_eq!(totals.today_requests, 5.0);
+        assert_eq!(totals.today_tokens, 510.0);
+        assert_eq!(totals.today_credits, 3.5);
+    }
+
+    /// RPM 限流：窗口内计数到上限即拒绝，跨分钟窗口重置，0 = 不限。
+    #[test]
+    fn rpm_limit_counts_per_minute_and_resets_each_window() {
+        let mut windows = HashMap::new();
+        // rpm = 2：前两次放行，第三次拒绝。
+        assert!(rpm_allow(&mut windows, "sk_a", 2, 61));
+        assert!(rpm_allow(&mut windows, "sk_a", 2, 61));
+        assert!(!rpm_allow(&mut windows, "sk_a", 2, 119));
+        // 下一分钟窗口重置。
+        assert!(rpm_allow(&mut windows, "sk_a", 2, 120));
+        // 不同子 Key 互不影响。
+        assert!(rpm_allow(&mut windows, "sk_b", 1, 120));
+        assert!(!rpm_allow(&mut windows, "sk_b", 1, 120));
+        // rpm = 0 视为不限（兼容旧数据）。
+        for _ in 0..100 {
+            assert!(rpm_allow(&mut windows, "sk_c", 0, 120));
+        }
+    }
+
+    /// 多实例并发写：单调累计字段取最大合并，另一个进程的旧内存整文件覆写不得冲掉
+    /// 本进程累计的 Token / 积分（2026-10-05 实证「积分被冲成当次请求的值」）。
+    #[test]
+    fn merge_keeps_the_larger_counters_and_never_resurrects_deleted_keys() {
+        let mut ours = json!({
+            "upstream_keys": [
+                {"key_id": "ck_a", "used_count": 100, "total_tokens": 5000, "total_credits": 3.5, "last_used_at": "2026-10-05T22:00:00+08:00", "status": "active"},
+            ],
+            "sub_api_keys": [
+                {"key_id": "sk_a", "used_count": 60, "total_tokens": 3000, "total_credits": 1.2},
+            ],
+            "daily_stats": {
+                "upstream": {
+                    "ck_a": {"2026-10-05": {"count": 100, "credits": 3.5, "total_tokens": 5000}},
+                    "ck_ours_only": {"2026-10-05": {"count": 1, "credits": 0.1, "total_tokens": 10}}
+                }
+            },
+            "request_logs": [
+                {"timestamp": 3.0, "event": "end", "sub_key_id": "sk_a"},
+                {"timestamp": 1.0, "event": "end", "sub_key_id": "sk_a"}
+            ],
+        });
+        // 另一进程的旧内存：计数整体更小、日志只有更早的一条、还有一个本进程已删除的 Key。
+        let disk = json!({
+            "upstream_keys": [
+                {"key_id": "ck_a", "used_count": 80, "total_tokens": 4000, "total_credits": 1.0, "last_used_at": "2026-10-05T21:00:00+08:00", "status": "disabled"},
+                {"key_id": "ck_deleted", "used_count": 999, "total_tokens": 999, "total_credits": 9.0}
+            ],
+            "sub_api_keys": [
+                {"key_id": "sk_a", "used_count": 80, "total_tokens": 3500, "total_credits": 0.4},
+            ],
+            "daily_stats": {
+                "upstream": {
+                    "ck_a": {"2026-10-05": {"count": 80, "credits": 1.0, "total_tokens": 4000}, "2026-10-04": {"count": 7, "credits": 0.7, "total_tokens": 70}},
+                    "ck_deleted": {"2026-10-05": {"count": 9, "credits": 0.9, "total_tokens": 90}}
+                },
+                "sub": {"sk_a": {"2026-10-05": {"count": 80, "credits": 0.4, "total_tokens": 3500}}}
+            },
+            "request_logs": [
+                {"timestamp": 1.0, "event": "end", "sub_key_id": "sk_a"},
+                {"timestamp": 2.0, "event": "end", "sub_key_id": "sk_b"}
+            ],
+        });
+        merge_monotonic_fields(&mut ours, &disk);
+
+        // 本进程更大的计数原样保留（不被旧值冲掉）；磁盘更大的字段被吸收。
+        let ck_a = &ours["upstream_keys"][0];
+        assert_eq!(ck_a["used_count"], json!(100));
+        assert_eq!(ck_a["total_tokens"], json!(5000));
+        assert_eq!(ck_a["total_credits"], json!(3.5));
+        assert_eq!(ck_a["status"], json!("active"), "状态字段以本进程为准");
+        let sk_a = &ours["sub_api_keys"][0];
+        assert_eq!(sk_a["used_count"], json!(80), "磁盘更大的计数要吸收");
+        assert_eq!(sk_a["total_tokens"], json!(3500));
+        assert_eq!(sk_a["total_credits"], json!(1.2), "积分取最大");
+        // 磁盘上多出来的 Key 不得复活（本进程可能刚删除它）。
+        assert_eq!(ours["upstream_keys"].as_array().unwrap().len(), 1);
+        // 每日统计：同日期取最大，磁盘独有的日期 / 类别并入。
+        let upstream_daily = &ours["daily_stats"]["upstream"]["ck_a"];
+        assert_eq!(upstream_daily["2026-10-05"]["count"], json!(100));
+        assert_eq!(upstream_daily["2026-10-04"]["count"], json!(7));
+        assert_eq!(ours["daily_stats"]["sub"]["sk_a"]["2026-10-05"]["count"], json!(80));
+        // 日志：并集去重、按时间排序。
+        let logs = ours["request_logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 3);
+        let stamps: Vec<f64> = logs
+            .iter()
+            .map(|entry| entry["timestamp"].as_f64().unwrap())
+            .collect();
+        assert_eq!(stamps, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// 限额判定：次数 → Token → 积分的固定顺序；`used == max` 即拒绝；0 / 缺省 = 不限。
+    #[test]
+    fn sub_key_limits_hit_in_order_and_respect_zero_as_unlimited() {
+        // 全部不设限 → 放行。
+        assert_eq!(check_sub_key_limits(&json!({})), None);
+        assert_eq!(
+            check_sub_key_limits(
+                &json!({"max_usage": 0, "used_count": 999, "max_tokens": 0, "total_tokens": 999, "max_credits": 0.0, "total_credits": 999.0})
+            ),
+            None
+        );
+        // 次数优先命中。
+        assert_eq!(
+            check_sub_key_limits(
+                &json!({"max_usage": 10, "used_count": 10, "max_tokens": 5, "total_tokens": 9})
+            ),
+            Some(SubKeyLimit::Usage { used: 10, max: 10 })
+        );
+        // 次数未超限 → Token 命中。
+        assert_eq!(
+            check_sub_key_limits(
+                &json!({"max_usage": 10, "used_count": 9, "max_tokens": 100, "total_tokens": 100})
+            ),
+            Some(SubKeyLimit::Tokens { used: 100, max: 100 })
+        );
+        // 积分命中（达到上限即拒绝）。
+        assert_eq!(
+            check_sub_key_limits(
+                &json!({"max_credits": 2.5, "total_credits": 2.5})
+            ),
+            Some(SubKeyLimit::Credits { used: 2.5, max: 2.5 })
+        );
+        // 差一点也不拒绝。
+        assert_eq!(
+            check_sub_key_limits(
+                &json!({"max_usage": 10, "used_count": 9, "max_tokens": 100, "total_tokens": 99, "max_credits": 2.5, "total_credits": 2.49})
+            ),
+            None
+        );
+        assert_eq!(SubKeyLimit::Usage { used: 1, max: 1 }.message(), "Usage limit exceeded");
+        assert_eq!(SubKeyLimit::Tokens { used: 1, max: 1 }.message(), "Token limit exceeded");
+        assert_eq!(SubKeyLimit::Credits { used: 1.0, max: 1.0 }.message(), "Credit limit exceeded");
+    }
+
+    /// 清空日志墓碑：合并时早于墓碑的条目不得被另一进程的旧日志带回来；
+    /// 墓碑取双方较大者，晚于墓碑的新日志保留。
+    #[test]
+    fn cleared_logs_stay_cleared_across_merges() {
+        let mut ours = json!({
+            "request_logs": [{"timestamp": 150.0, "event": "end", "note": "ours-new"}],
+            "logs_cleared_at": 100.0,
+        });
+        let disk = json!({
+            "request_logs": [
+                {"timestamp": 80.0, "event": "end", "note": "disk-old"},
+                {"timestamp": 120.0, "event": "end", "note": "disk-new"}
+            ],
+        });
+        merge_monotonic_fields(&mut ours, &disk);
+        let logs = ours["request_logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2, "早于墓碑的 disk-old 不得复活：{logs:?}");
+        assert_eq!(logs[0]["note"], json!("disk-new"));
+        assert_eq!(logs[1]["note"], json!("ours-new"));
+        assert_eq!(ours["logs_cleared_at"], json!(100.0), "墓碑必须随合并保留");
+
+        // 磁盘上有更大的墓碑（另一实例后清的）→ 采纳大墓碑，中间段落一并清掉。
+        let mut ours = json!({
+            "request_logs": [{"timestamp": 150.0, "event": "end"}],
+            "logs_cleared_at": 100.0,
+        });
+        let disk = json!({"request_logs": [], "logs_cleared_at": 200.0});
+        merge_monotonic_fields(&mut ours, &disk);
+        assert!(ours["request_logs"].as_array().unwrap().is_empty());
+        assert_eq!(ours["logs_cleared_at"], json!(200.0));
+    }
+
+    /// 重载收敛：磁盘是配置权威（另一实例改了上限 / 新增 Key），
+    /// 本进程已累计的计数与积分不得被磁盘的旧值冲掉。
+    #[test]
+    fn reload_adopts_disk_config_but_keeps_our_counters() {
+        let ours = json!({
+            "sub_api_keys": [
+                {"key_id": "sk_a", "label": "旧标签", "max_credits": 100.0, "used_count": 50, "total_tokens": 9000, "total_credits": 7.5}
+            ],
+            "request_logs": [],
+        });
+        let disk = json!({
+            "sub_api_keys": [
+                {"key_id": "sk_a", "label": "新标签", "max_credits": 300.0, "used_count": 40, "total_tokens": 8000, "total_credits": 2.0},
+                {"key_id": "sk_b", "label": "另一实例新建", "used_count": 1, "total_tokens": 10, "total_credits": 0.1}
+            ],
+            "request_logs": [],
+        });
+        let merged = converge_on_reload(&ours, &disk);
+        let sk_a = &merged["sub_api_keys"][0];
+        assert_eq!(sk_a["label"], json!("新标签"), "配置以磁盘为准");
+        assert_eq!(sk_a["max_credits"], json!(300.0));
+        assert_eq!(sk_a["used_count"], json!(50), "计数取最大，不得回退");
+        assert_eq!(sk_a["total_tokens"], json!(9000));
+        assert_eq!(sk_a["total_credits"], json!(7.5));
+        assert_eq!(merged["sub_api_keys"].as_array().unwrap().len(), 2, "另一实例新建的 Key 要同步进来");
+
+        // 写盘收敛：本进程是配置权威，磁盘的更大计数被吸收。
+        let merged = converge_on_save(&ours, &disk);
+        let sk_a = &merged["sub_api_keys"][0];
+        assert_eq!(sk_a["label"], json!("旧标签"), "写盘时配置以本进程为准");
+        assert_eq!(sk_a["used_count"], json!(50));
+        assert_eq!(merged["sub_api_keys"].as_array().unwrap().len(), 1, "写盘不采纳磁盘多出的 Key（防复活已删 Key）");
+    }
+
+    /// 账本折叠：基线并入、逐请求累计、清零后只计清零之后的事件、透传不计。
+    #[test]
+    fn usage_ledger_folds_baseline_events_and_resets() {
+        let mut fold = UsageFold::default();
+        for line in [
+            r#"{"type":"baseline","upstream":{"ck_a":{"used":10,"prompt":100,"completion":50,"total":150,"cached":0,"credits":1.0}},"daily_upstream":{"ck_a|2026-10-04":{"used":10,"prompt":100,"completion":50,"total":150,"cached":0,"credits":1.0}}}"#,
+            r#"{"type":"end","ts":1000.0,"date":"2026-10-05","upstream":"ck_a","sub":"sk_a","prompt":10,"completion":5,"total":15,"cached":0,"credit":0.5}"#,
+            r#"{"type":"end","ts":1001.0,"date":"2026-10-05","upstream":"ck_a","sub":"sk_a","prompt":20,"completion":5,"total":25,"cached":0,"credit":0.25}"#,
+            r#"{"type":"reset","scope":"sub","key_id":"sk_a","ts":1002.0}"#,
+            // 不晚于清零时刻的事件：不计入（时钟跳变 / 乱序也安全）。
+            r#"{"type":"end","ts":1001.5,"date":"2026-10-05","sub":"sk_a","prompt":99,"completion":0,"total":99,"cached":0,"credit":9.9}"#,
+            r#"{"type":"end","ts":1003.0,"date":"2026-10-05","sub":"sk_a","prompt":7,"completion":3,"total":10,"cached":0,"credit":0.1}"#,
+            // 透传模式不计子 Key。
+            r#"{"type":"end","ts":1004.0,"date":"2026-10-05","sub":"_passthrough_","prompt":1,"completion":1,"total":2,"cached":0,"credit":0.01}"#,
+            // 坏行静默跳过。
+            "{not json",
+        ] {
+            fold_line(&mut fold, line);
+        }
+        let up = &fold.upstream["ck_a"];
+        assert_eq!((up.used, up.total, up.credits), (12, 190, 1.75));
+        let sub = &fold.sub["sk_a"];
+        assert_eq!(
+            (sub.used, sub.total, sub.credits),
+            (1, 10, 0.1),
+            "清零后只计清零之后的事件"
+        );
+        assert!(!fold.sub.contains_key("_passthrough_"));
+        assert_eq!(
+            fold.daily_upstream[&("ck_a".to_string(), "2026-10-05".to_string())].used,
+            2
+        );
+        assert_eq!(
+            fold.daily_upstream[&("ck_a".to_string(), "2026-10-04".to_string())].used,
+            10,
+            "基线的每日统计并入"
+        );
+        // 重复基线不叠加（逐字段取最大）。
+        fold_line(&mut fold, r#"{"type":"baseline","upstream":{"ck_a":{"used":10,"prompt":100,"completion":50,"total":150,"cached":0,"credits":1.0}}}"#);
+        assert_eq!(fold.upstream["ck_a"].used, 12);
+    }
+
+    /// 账本回写：proxy_db 的累计字段被其它进程冲掉后，按折叠结果自愈重建。
+    #[test]
+    fn sync_usage_into_db_restores_clobbered_counters() {
+        let mut fold = UsageFold {
+            ledger_present: true,
+            ..UsageFold::default()
+        };
+        fold.upstream.insert(
+            "ck_a".to_string(),
+            KeyFold { used: 66, prompt: 1000, completion: 500, total: 1500, cached: 10, credits: 7.25 },
+        );
+        fold.sub.insert(
+            "sk_a".to_string(),
+            KeyFold { used: 9, prompt: 90, completion: 10, total: 100, cached: 0, credits: 1.23456 },
+        );
+        fold.daily_sub.insert(
+            ("sk_a".to_string(), "2026-10-05".to_string()),
+            KeyFold { used: 9, prompt: 90, completion: 10, total: 100, cached: 0, credits: 1.23456 },
+        );
+        // 模拟被旧实例覆写后的 proxy_db：计数全被冲小。
+        let mut data = json!({
+            "upstream_keys": [{"key_id": "ck_a", "used_count": 1, "total_tokens": 5, "total_credits": 0.01, "status": "active"}],
+            "sub_api_keys": [{"key_id": "sk_a", "used_count": 0, "total_tokens": 0, "total_credits": 0.0, "max_credits": 300.0}],
+            "daily_stats": {"upstream": {}, "sub": {}},
+        });
+        sync_usage_into_db(&mut data, &fold);
+        let ck = &data["upstream_keys"][0];
+        assert_eq!(ck["used_count"], json!(66));
+        assert_eq!(ck["total_tokens"], json!(1500));
+        assert_eq!(ck["total_credits"], json!(7.25));
+        assert_eq!(ck["status"], json!("active"), "非统计字段不动");
+        let sk = &data["sub_api_keys"][0];
+        assert_eq!(sk["used_count"], json!(9));
+        assert_eq!(sk["total_credits"], json!(1.2346), "回写保留 4 位小数");
+        assert_eq!(sk["max_credits"], json!(300.0), "限额配置不动");
+        let day = &data["daily_stats"]["sub"]["sk_a"]["2026-10-05"];
+        assert_eq!(day["count"], json!(9));
+        assert_eq!(day["credits"], json!(1.2346));
+
+        // 账本不存在：不动缓存（回退到 proxy_db 旧计数口径）。
+        let mut data = json!({"sub_api_keys": [{"key_id": "sk_a", "used_count": 42}]});
+        sync_usage_into_db(&mut data, &UsageFold::default());
+        assert_eq!(data["sub_api_keys"][0]["used_count"], json!(42));
+    }
 }

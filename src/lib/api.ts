@@ -881,6 +881,10 @@ export function deleteProxySubKey(keyId: string): Promise<{ ok: boolean }> {
   return call("delete_proxy_sub_key", { keyId });
 }
 
+export function resetProxySubKeyUsage(keyId: string): Promise<{ ok: boolean }> {
+  return call("reset_proxy_sub_key_usage", { keyId });
+}
+
 export function getProxyLogs(since = 0, limit = 200): Promise<{ logs: ProxyRequestLog[] }> {
   return call("get_proxy_logs", { since, limit });
 }

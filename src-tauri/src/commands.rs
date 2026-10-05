@@ -1106,6 +1106,13 @@ pub fn delete_proxy_sub_key(key_id: String) -> Value {
     json!({ "ok": true })
 }
 
+/// POST /api/proxy/sub-keys/reset-usage —— 清零子 Key 累计用量（次数 / Token / 积分）。
+#[tauri::command]
+pub fn reset_proxy_sub_key_usage(key_id: String) -> Value {
+    proxy::reset_sub_key_usage(&key_id);
+    json!({ "ok": true })
+}
+
 /// GET /api/proxy/logs —— 请求日志（since 之后，最多 limit 条）。
 #[tauri::command]
 pub fn get_proxy_logs(since: Option<f64>, limit: Option<usize>) -> Value {

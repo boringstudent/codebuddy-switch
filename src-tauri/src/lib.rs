@@ -207,6 +207,7 @@ pub fn run() {
             commands::create_proxy_sub_key,
             commands::update_proxy_sub_key,
             commands::delete_proxy_sub_key,
+            commands::reset_proxy_sub_key_usage,
             commands::get_proxy_logs,
             commands::clear_proxy_logs,
             commands::get_proxy_daily_stats,

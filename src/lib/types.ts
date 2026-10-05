@@ -1087,6 +1087,8 @@ export interface ProxyRequestLog {
   duration_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  /** 本次请求消耗的积分（end 事件）。 */
+  credit?: number;
   first_token_ms?: number;
   error?: string;
   upstream_status?: number;

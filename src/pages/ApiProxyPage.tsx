@@ -96,9 +96,8 @@ const KEY_MODES = [
 function fmtTokens(n: number | undefined): string {
   const value = n ?? 0;
   if (value <= 0) return "0";
-  if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(2)}亿`;
-  if (value >= 10_000) return `${(value / 10_000).toFixed(2)}万`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
   return String(value);
 }
 
@@ -290,8 +289,8 @@ function SubKeyDialog({
   const [models, setModels] = useState<Set<string>>(new Set());
   const [keyIds, setKeyIds] = useState<Set<string>>(new Set());
   const [maxUsage, setMaxUsage] = useState(0);
-  // Token 上限以「万」为单位输入，避免手填一长串 0。
-  const [maxTokensWan, setMaxTokensWan] = useState(0);
+  // Token 上限以 M（1M = 1,000,000）为单位输入，避免手填一长串 0。
+  const [maxTokensM, setMaxTokensM] = useState(0);
   const [maxCredits, setMaxCredits] = useState(0);
   const [rpm, setRpm] = useState(1000);
   const [keyMode, setKeyMode] = useState(1);
@@ -303,7 +302,7 @@ function SubKeyDialog({
     setModels(new Set(editKey?.allowed_models ?? []));
     setKeyIds(new Set(editKey?.allowed_key_ids ?? []));
     setMaxUsage(editKey?.max_usage ?? 0);
-    setMaxTokensWan((editKey?.max_tokens ?? 0) / 10000);
+    setMaxTokensM((editKey?.max_tokens ?? 0) / 1_000_000);
     setMaxCredits(editKey?.max_credits ?? 0);
     setRpm(editKey?.rate_limit_rpm ?? 1000);
     setKeyMode(editKey?.key_mode ?? 1);
@@ -324,7 +323,7 @@ function SubKeyDialog({
         allowed_models: [...models],
         allowed_key_ids: [...keyIds],
         max_usage: Math.max(0, maxUsage),
-        max_tokens: Math.max(0, Math.round(maxTokensWan * 10000)),
+        max_tokens: Math.max(0, Math.round(maxTokensM * 1_000_000)),
         max_credits: Math.max(0, maxCredits),
         rate_limit_rpm: Math.max(1, rpm),
         key_mode: keyMode,
@@ -393,15 +392,15 @@ function SubKeyDialog({
               <p className="text-[11px] text-muted-foreground">0 = 无限</p>
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label>Token 上限（万）</Label>
+              <Label>Token 上限（M）</Label>
               <Input
                 type="number"
                 min={0}
                 step="any"
-                value={maxTokensWan}
-                onChange={(e) => setMaxTokensWan(Number(e.target.value) || 0)}
+                value={maxTokensM}
+                onChange={(e) => setMaxTokensM(Number(e.target.value) || 0)}
               />
-              <p className="text-[11px] text-muted-foreground">累计 Token，0 = 不限</p>
+              <p className="text-[11px] text-muted-foreground">1M = 1,000,000，0 = 不限</p>
             </div>
             <div className="flex flex-col gap-1.5">
               <Label>积分上限</Label>
@@ -773,6 +772,19 @@ export default function ApiProxyPage() {
     }
   };
 
+  const resetSubKeyUsage = async (key: ProxySubKey) => {
+    if (!window.confirm(`确定清零「${key.label || key.key_id}」的累计用量（次数 / Token / 积分）吗？限额将重新起算。`)) {
+      return;
+    }
+    try {
+      await api.resetProxySubKeyUsage(key.key_id);
+      toast.success("用量已清零");
+      await Promise.all([loadSubKeys(), loadOverview()]);
+    } catch (cause) {
+      toast.error(asError(cause));
+    }
+  };
+
   const running = Boolean(status?.running);
   const serviceUrl = running
     ? `http://127.0.0.1:${status?.port}/v1`
@@ -1095,7 +1107,7 @@ export default function ApiProxyPage() {
                       </TableCell>
                       <TableCell className="text-xs">{keyModeLabel(k.key_mode)}</TableCell>
                       <TableCell
-                        title={`输入: ${k.total_prompt_tokens ?? 0} 输出: ${k.total_completion_tokens ?? 0} 总计: ${k.total_tokens ?? 0}${k.max_tokens ? ` / 上限 ${k.max_tokens}` : ""}`}
+                        title={`输入: ${k.total_prompt_tokens ?? 0} 输出: ${k.total_completion_tokens ?? 0} 总计: ${k.total_tokens ?? 0}${k.max_tokens ? ` / 上限 ${fmtTokens(k.max_tokens)}` : ""}`}
                       >
                         <span className={usageTone(k.total_tokens ?? 0, k.max_tokens)}>
                           {k.max_tokens
@@ -1136,6 +1148,15 @@ export default function ApiProxyPage() {
                             onClick={() => void toggleSubKey(k)}
                           >
                             {k.is_active ? "禁用" : "启用"}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-xs"
+                            title="清零累计用量（次数 / Token / 积分），用于重新测试限额"
+                            onClick={() => void resetSubKeyUsage(k)}
+                          >
+                            清零
                           </Button>
                           <Button size="sm" variant="ghost" className="h-7 px-2 text-xs text-red-600" onClick={() => void removeSubKey(k.key_id)}>
                             <Trash2 className="size-3.5" />
@@ -1225,8 +1246,9 @@ function LogLine({ log }: { log: ProxyRequestLog }) {
   if (log.model) parts.push(`模型:${log.model}`);
   if (log.event === "end") {
     parts.push(
-      `完成 ${log.duration_ms ?? 0}ms 首字 ${log.first_token_ms ?? 0}ms token ${log.prompt_tokens ?? 0}+${log.completion_tokens ?? 0}`,
+      `完成 ${log.duration_ms ?? 0}ms 首字 ${log.first_token_ms ?? 0}ms token ${fmtTokens(log.prompt_tokens)}+${fmtTokens(log.completion_tokens)}`,
     );
+    if (log.credit != null) parts.push(`积分 ${log.credit.toFixed(4)}`);
   }
   if (log.error) parts.push(log.error);
   const isError = ["error", "auth_fail", "upstream_error", "upstream_429"].includes(event);
