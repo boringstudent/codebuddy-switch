@@ -50,6 +50,7 @@ import type {
   ProxyRequestLog,
   ProxyServerStatus,
   ProxySubKey,
+  ProxySubKeyModelStats,
   ProxyUpstreamKey,
   VscodeSessionList,
   VscodeSessionRef,
@@ -898,4 +899,9 @@ export function getProxyDailyStats(
   keyId: string,
 ): Promise<Record<string, ProxyDailyStat>> {
   return call("get_proxy_daily_stats", { category, keyId });
+}
+
+/** 子 Key 的模型维度统计（总调用 / 各模型次数 / Token / 占比）。 */
+export function getProxySubKeyModelStats(keyId: string): Promise<ProxySubKeyModelStats> {
+  return call("get_proxy_sub_key_model_stats", { keyId });
 }

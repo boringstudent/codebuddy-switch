@@ -1055,6 +1055,12 @@ export interface ProxySettings {
   mode: string;
   upstream_proxy: string;
   auto_start: boolean;
+  /** 日志保留天数，0 = 不按天数清理 */
+  log_retention_days?: number;
+  /** 日志体积上限 MB，0 = 不按体积清理 */
+  log_retention_max_mb?: number;
+  /** 使用日志是否记录问答内容（成功请求，各限 500 字） */
+  log_content_enabled?: boolean;
 }
 
 /** 代理服务运行状态。 */
@@ -1082,7 +1088,7 @@ export interface ProxyRequestLog {
   main_key_id?: string;
   main_key_label?: string;
   model?: string;
-  /** request / start / end / error / auth_fail / upstream_error / upstream_429 */
+  /** request / start / end / error / auth_fail / upstream_error / upstream_429 / log_prune */
   event: string;
   duration_ms?: number;
   prompt_tokens?: number;
@@ -1093,6 +1099,33 @@ export interface ProxyRequestLog {
   error?: string;
   upstream_status?: number;
   request_path?: string;
+  /** 用户提问文本（end 事件，最多 500 字）。 */
+  question?: string;
+  /** AI 回复文本（end 事件，最多 500 字）。 */
+  answer?: string;
+}
+
+/** 子 Key 单个模型的统计。 */
+export interface ProxySubKeyModelStat {
+  model: string;
+  count: number;
+  total_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  credits: number;
+  /** 调用次数占比（%） */
+  count_pct: number;
+  /** Token 占比（%） */
+  token_pct: number;
+}
+
+/** 子 Key 的模型维度统计。 */
+export interface ProxySubKeyModelStats {
+  key_id: string;
+  total_count: number;
+  total_tokens: number;
+  models: ProxySubKeyModelStat[];
 }
 
 /** 单个 Key 某一天的统计。 */

@@ -211,6 +211,7 @@ pub fn run() {
             commands::get_proxy_logs,
             commands::clear_proxy_logs,
             commands::get_proxy_daily_stats,
+            commands::get_proxy_sub_key_model_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

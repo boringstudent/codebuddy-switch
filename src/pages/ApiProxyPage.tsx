@@ -23,6 +23,7 @@ import type {
   ProxyRequestLog,
   ProxyServerStatus,
   ProxySubKey,
+  ProxySubKeyModelStats,
   ProxyUpstreamKey,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -299,7 +300,9 @@ function SubKeyDialog({
   useEffect(() => {
     if (!open) return;
     setLabel(editKey?.label ?? "");
-    setModels(new Set(editKey?.allowed_models ?? []));
+    // 允许模型默认全选：新建 / 未限制（空 = 全部）时全部勾选，用户自行取消来限制。
+    const allowed = editKey?.allowed_models ?? [];
+    setModels(new Set(allowed.length === 0 ? SUPPORTED_MODELS : allowed));
     setKeyIds(new Set(editKey?.allowed_key_ids ?? []));
     setMaxUsage(editKey?.max_usage ?? 0);
     setMaxTokensM((editKey?.max_tokens ?? 0) / 1_000_000);
@@ -318,9 +321,11 @@ function SubKeyDialog({
   const submit = async () => {
     setSaving(true);
     try {
+      // 全选或全不选都等价于「不限制」（后端空数组 = 全部允许）。
+      const allSelected = models.size === SUPPORTED_MODELS.length;
       await onSubmit({
         label: label.trim(),
-        allowed_models: [...models],
+        allowed_models: allSelected || models.size === 0 ? [] : [...models],
         allowed_key_ids: [...keyIds],
         max_usage: Math.max(0, maxUsage),
         max_tokens: Math.max(0, Math.round(maxTokensM * 1_000_000)),
@@ -341,7 +346,7 @@ function SubKeyDialog({
       <DialogContent className="max-w-xl">
         <DialogHeader>
           <DialogTitle>{editKey ? "编辑子 API Key" : "创建子 API Key"}</DialogTitle>
-          <DialogDescription>模型与上游 Key 均不勾选表示「全部允许」。</DialogDescription>
+          <DialogDescription>允许模型默认全选（取消勾选即限制）；上游 Key 不勾选表示「全部允许」。</DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
           <div className="grid gap-1.5">
@@ -349,7 +354,7 @@ function SubKeyDialog({
             <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="子 Key 标签（如用户名）" />
           </div>
           <div className="grid gap-1.5">
-            <Label>限制模型（不选 = 全部模型）</Label>
+            <Label>允许模型（默认全选，取消勾选即限制）</Label>
             <div className="grid max-h-36 grid-cols-2 gap-x-3 overflow-y-auto rounded-md border p-2 sm:grid-cols-3">
               {SUPPORTED_MODELS.map((m) => (
                 <label key={m} className="flex cursor-pointer items-center gap-1.5 py-0.5 text-xs">
@@ -375,6 +380,9 @@ function SubKeyDialog({
                       onCheckedChange={(v) => setKeyIds((prev) => toggleSet(prev, k.key_id, v === true))}
                     />
                     <span className="truncate">{k.label || k.key_id}</span>
+                    <span className={cn("shrink-0", k.points ? "text-emerald-600" : "text-muted-foreground")}>
+                      积分 {k.points || "未知"}
+                    </span>
                   </label>
                 ))
               )}
@@ -545,6 +553,89 @@ function DailyDetailDialog({
   );
 }
 
+/** 子 Key 模型维度统计弹窗：总调用 / 各模型次数 / Token / 占比（纯文字表格）。 */
+function ModelStatsDialog({
+  open,
+  onOpenChange,
+  subKey,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  subKey: ProxySubKey | null;
+}) {
+  const [stats, setStats] = useState<ProxySubKeyModelStats | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open || !subKey) return;
+    setLoading(true);
+    api
+      .getProxySubKeyModelStats(subKey.key_id)
+      .then(setStats)
+      .catch((cause) => toast.error(`加载模型统计失败: ${asError(cause)}`))
+      .finally(() => setLoading(false));
+  }, [open, subKey]);
+
+  const models = stats?.models ?? [];
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{subKey?.label || subKey?.key_id} · 模型调用统计</DialogTitle>
+          <DialogDescription>
+            总调用 {stats?.total_count ?? 0} 次 · 总 Token {fmtTokens(stats?.total_tokens ?? 0)}
+            （统计自功能上线后，此前历史归 unknown）
+          </DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" /> 加载中…
+          </div>
+        ) : models.length === 0 ? (
+          <div className="py-6 text-sm text-muted-foreground">暂无调用数据</div>
+        ) : (
+          <div className="max-h-80 overflow-y-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>模型</TableHead>
+                  <TableHead>调用次数</TableHead>
+                  <TableHead>次数占比</TableHead>
+                  <TableHead>Token</TableHead>
+                  <TableHead>Token占比</TableHead>
+                  <TableHead>积分消耗</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {models.map((m) => (
+                  <TableRow key={m.model}>
+                    <TableCell className="font-mono text-xs">
+                      {m.model === "unknown" ? "历史（功能上线前）" : m.model}
+                    </TableCell>
+                    <TableCell>{m.count}</TableCell>
+                    <TableCell>{m.count_pct.toFixed(2)}%</TableCell>
+                    <TableCell title={`输入: ${m.prompt_tokens} 输出: ${m.completion_tokens} 缓存: ${m.cached_tokens}`}>
+                      {fmtTokens(m.total_tokens)}
+                    </TableCell>
+                    <TableCell>{m.token_pct.toFixed(2)}%</TableCell>
+                    <TableCell>{m.credits.toFixed(2)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 页面主体
 // ---------------------------------------------------------------------------
@@ -556,11 +647,16 @@ export default function ApiProxyPage() {
   const [mode, setMode] = useState("local");
   const [autoStart, setAutoStart] = useState(false);
   const [upstreamProxy, setUpstreamProxy] = useState("");
+  const [logRetentionDays, setLogRetentionDays] = useState(7);
+  const [logRetentionMaxMb, setLogRetentionMaxMb] = useState(50);
+  const [logContentEnabled, setLogContentEnabled] = useState(true);
   const [toggling, setToggling] = useState(false);
 
   const [upstreamKeys, setUpstreamKeys] = useState<ProxyUpstreamKey[]>([]);
   const [subKeys, setSubKeys] = useState<ProxySubKey[]>([]);
   const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
+  // 日志自动下滑开关（localStorage 持久化，默认开）。
+  const [autoScroll, setAutoScroll] = useState(() => localStorage.getItem("proxy_log_autoscroll") !== "0");
   const [overview, setOverview] = useState<ProxyOverview | null>(null);
   const [refreshingPoints, setRefreshingPoints] = useState(false);
   const [checkingStatus, setCheckingStatus] = useState(false);
@@ -569,6 +665,7 @@ export default function ApiProxyPage() {
   const [subKeyDialogOpen, setSubKeyDialogOpen] = useState(false);
   const [editingSubKey, setEditingSubKey] = useState<ProxySubKey | null>(null);
   const [detail, setDetail] = useState<{ title: string; category: "upstream" | "sub"; keyId: string } | null>(null);
+  const [modelStatsKey, setModelStatsKey] = useState<ProxySubKey | null>(null);
   const [activeTab, setActiveTab] = useState("upstream");
 
   const logBoxRef = useRef<HTMLDivElement>(null);
@@ -580,6 +677,9 @@ export default function ApiProxyPage() {
     setMode(s.settings?.mode ?? s.mode ?? "local");
     setAutoStart(Boolean(s.settings?.auto_start));
     setUpstreamProxy(s.settings?.upstream_proxy ?? "");
+    setLogRetentionDays(Number(s.settings?.log_retention_days ?? 7));
+    setLogRetentionMaxMb(Number(s.settings?.log_retention_max_mb ?? 50));
+    setLogContentEnabled(s.settings?.log_content_enabled ?? true);
   }, []);
 
   const loadUpstreamKeys = useCallback(async () => {
@@ -631,12 +731,19 @@ export default function ApiProxyPage() {
     return () => window.clearInterval(timer);
   }, [loadOverview]);
 
-  // 日志更新后滚到底部（useLayoutEffect 保证绘制前完成滚动，新日志始终自动下滑可见）。
+  // 日志更新后滚到底部（切到日志 Tab 时立即定位最新一条）。
+  // useLayoutEffect 绘制前滚一次，rAF 在布局/绘制后再兜底一次——
+  // 内容刚渲染时 scrollHeight 可能还是旧值，单靠一次设置会滚不到位。
   useLayoutEffect(() => {
-    if (activeTab === "logs" && logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [logs, activeTab]);
+    if (activeTab !== "logs" || !autoScroll) return;
+    const el = logBoxRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [logs, activeTab, autoScroll]);
 
   const toggleService = async () => {
     setToggling(true);
@@ -670,6 +777,16 @@ export default function ApiProxyPage() {
       .writeText(text)
       .then(() => toast.success(`${label}已复制`))
       .catch(() => toast.error("复制失败"));
+  };
+
+  /** 子 Key 绑定上游的剩余积分明细（总积分列的 tooltip，未绑定 = 全部上游）。 */
+  const upstreamPointsDetail = (k: ProxySubKey): string => {
+    const bound = k.allowed_key_ids.length
+      ? upstreamKeys.filter((u) => k.allowed_key_ids.includes(u.key_id))
+      : upstreamKeys;
+    if (bound.length === 0) return "无可用上游";
+    const lines = bound.map((u) => `${u.label || u.key_id}: ${u.points || "未知"}`);
+    return `${k.allowed_key_ids.length ? "绑定上游" : "未限定上游（全部）"}剩余积分：\n${lines.join("\n")}`;
   };
 
   /** 后台逐个处理期间每 1.5 秒拉一次 Key 列表，表格随每个 Key 的处理结果渐进更新。 */
@@ -893,6 +1010,39 @@ export default function ApiProxyPage() {
               className="max-w-sm"
             />
           </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Label className="shrink-0 text-sm text-muted-foreground">日志保留</Label>
+            <Input
+              type="number"
+              min={0}
+              max={365}
+              value={logRetentionDays}
+              onChange={(e) => setLogRetentionDays(Math.min(365, Math.max(0, Number(e.target.value) || 0)))}
+              onBlur={() => void persistSettings({ log_retention_days: logRetentionDays })}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">天 /</span>
+            <Input
+              type="number"
+              min={0}
+              max={10240}
+              value={logRetentionMaxMb}
+              onChange={(e) => setLogRetentionMaxMb(Math.min(10240, Math.max(0, Number(e.target.value) || 0)))}
+              onBlur={() => void persistSettings({ log_retention_max_mb: logRetentionMaxMb })}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">MB（0 = 不限制，超限自动删除最旧）</span>
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={logContentEnabled}
+                onCheckedChange={(v) => {
+                  setLogContentEnabled(v);
+                  void persistSettings({ log_content_enabled: v });
+                }}
+              />
+              <Label className="text-sm text-muted-foreground">日志记录问答内容（各限 500 字）</Label>
+            </div>
+          </div>
         </CardContent>
       </Card>
 
@@ -1095,10 +1245,10 @@ export default function ApiProxyPage() {
                       <TableCell className="max-w-32 truncate" title={k.allowed_models.join(", ") || "全部模型"}>
                         {k.allowed_models.length === 0 ? "全部" : `${k.allowed_models.length} 个模型`}
                       </TableCell>
-                      <TableCell>
+                      <TableCell title={`RPM 限流: ${k.rate_limit_rpm > 0 ? `${k.rate_limit_rpm}/分钟` : "不限"}`}>
                         {k.used_count ?? 0}/{k.max_usage > 0 ? k.max_usage : "∞"}
                       </TableCell>
-                      <TableCell>
+                      <TableCell title={upstreamPointsDetail(k)}>
                         {k.total_points && k.total_points > 0 ? (
                           <span className="text-emerald-600">{k.total_points.toFixed(0)}</span>
                         ) : (
@@ -1125,6 +1275,15 @@ export default function ApiProxyPage() {
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-xs"
+                            title="按模型查看调用次数 / Token / 占比"
+                            onClick={() => setModelStatsKey(k)}
+                          >
+                            模型
+                          </Button>
                           <Button
                             size="sm"
                             variant="ghost"
@@ -1201,6 +1360,19 @@ export default function ApiProxyPage() {
               <Trash2 />
               清空
             </Button>
+            <div className="ml-auto flex items-center gap-2">
+              <Switch
+                id="log-autoscroll"
+                checked={autoScroll}
+                onCheckedChange={(v) => {
+                  setAutoScroll(v);
+                  localStorage.setItem("proxy_log_autoscroll", v ? "1" : "0");
+                }}
+              />
+              <Label htmlFor="log-autoscroll" className="cursor-pointer text-sm text-muted-foreground">
+                自动下滑
+              </Label>
+            </div>
           </div>
         </TabsContent>
       </Tabs>
@@ -1224,6 +1396,13 @@ export default function ApiProxyPage() {
           keyId={detail.keyId}
         />
       )}
+      <ModelStatsDialog
+        open={Boolean(modelStatsKey)}
+        onOpenChange={(open) => {
+          if (!open) setModelStatsKey(null);
+        }}
+        subKey={modelStatsKey}
+      />
     </div>
   );
 }
@@ -1238,6 +1417,7 @@ function OverviewMetric({ label, value, tip }: { label: string; value: string; t
 }
 
 function LogLine({ log }: { log: ProxyRequestLog }) {
+  const [expanded, setExpanded] = useState(false);
   const time = fmtLogTime(log.timestamp ?? 0);
   const event = log.event ?? "";
   const parts: string[] = [];
@@ -1251,10 +1431,34 @@ function LogLine({ log }: { log: ProxyRequestLog }) {
     if (log.credit != null) parts.push(`积分 ${log.credit.toFixed(4)}`);
   }
   if (log.error) parts.push(log.error);
-  const isError = ["error", "auth_fail", "upstream_error", "upstream_429"].includes(event);
+  const isError = ["error", "auth_fail", "upstream_error", "upstream_429", "rule_blocked"].includes(event);
+  // 成功请求带问答内容时可展开（内容在后端已各截断 500 字）。
+  const expandable = event === "end" && Boolean(log.question || log.answer);
   return (
     <div className={cn(isError && "text-red-400")}>
-      [{time}] [{event}] {parts.join(" ")}
+      <div className="flex items-start gap-1">
+        {expandable ? (
+          <button
+            type="button"
+            className="mt-px w-4 shrink-0 cursor-pointer select-none text-zinc-500 hover:text-zinc-200"
+            title={expanded ? "收起问答内容" : "展开问答内容"}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            {expanded ? "▾" : "▸"}
+          </button>
+        ) : (
+          <span className="w-4 shrink-0" />
+        )}
+        <div>
+          [{time}] [{event}] {parts.join(" ")}
+        </div>
+      </div>
+      {expandable && expanded && (
+        <div className="ml-5 mt-1 whitespace-pre-wrap break-all rounded border border-zinc-800 bg-zinc-900/60 p-2 leading-5">
+          {log.question && <div className="text-zinc-300">问：{log.question}</div>}
+          {log.answer && <div className="mt-1 text-zinc-400">答：{log.answer}</div>}
+        </div>
+      )}
     </div>
   );
 }

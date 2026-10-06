@@ -38,12 +38,63 @@ const UPSTREAM_CHAT_PATH: &str = "/chat/completions";
 const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
 /// 请求日志环形保留条数。
 const REQUEST_LOG_KEEP: usize = 1000;
+/// 日志默认保留天数（settings.log_retention_days 缺省值；显式 0 = 不按天数清理）。
+const DEFAULT_LOG_RETENTION_DAYS: u64 = 7;
+/// 日志默认体积上限 MB（settings.log_retention_max_mb 缺省值；显式 0 = 不按体积清理）。
+const DEFAULT_LOG_RETENTION_MAX_MB: u64 = 50;
 /// 单请求最多尝试的不同上游 Key 数。
 const MAX_RETRIES: usize = 3;
 /// 首字节超时：上游 10 秒不出首 chunk 视为可重试失败。
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 积分自动查询限频：同一 Key 5 分钟内最多查一次。
 const POINTS_QUERY_INTERVAL_SECS: u64 = 300;
+
+// 官方 CodeBuddy 客户端渠道标识（逆向自 CodeBuddy CN genie 扩展 4.12.1，见
+// docs/TODO-渠道指纹与积分显示.md）。上游网关按这些头判定「已批准渠道」，
+// 缺失会返回 400 code 11128（Illegal API invocation from an unapproved channel）。
+/// User-Agent 的 platform 段（官方默认 "VSCode"）。
+const OFFICIAL_PLATFORM: &str = "VSCode";
+/// genie 扩展版本（product.json genieVersion；官方升级后跟随调整）。
+const OFFICIAL_GENIE_VERSION: &str = "4.12.1";
+/// User-Agent 的 productName 段（扩展包名）。
+const OFFICIAL_PRODUCT_NAME: &str = "coding-copilot";
+
+/// 构造模拟官方客户端的渠道标识头。每次调用生成新的 trace/conversation 标识。
+///
+/// `upstream_key` 用于经账号库补 `X-User-Id`（官方鉴权拦截器会自动携带）。
+fn channel_headers(upstream_key: &Value) -> Vec<(&'static str, String)> {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    // B3 spanId 为 16 位 hex。
+    let span_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let mut headers = vec![
+        (
+            "User-Agent",
+            format!("{OFFICIAL_PLATFORM}/{OFFICIAL_GENIE_VERSION} {OFFICIAL_PRODUCT_NAME}/{OFFICIAL_GENIE_VERSION}"),
+        ),
+        ("X-IDE-Type", OFFICIAL_PLATFORM.to_string()),
+        ("X-IDE-Name", OFFICIAL_PLATFORM.to_string()),
+        ("X-IDE-Version", OFFICIAL_GENIE_VERSION.to_string()),
+        ("X-Product-Version", OFFICIAL_GENIE_VERSION.to_string()),
+        ("X-Product", "SaaS".to_string()),
+        ("X-Request-Trace-Id", uuid::Uuid::new_v4().to_string()),
+        ("X-Trace-ID", trace_id.clone()),
+        ("X-Conversation-ID", conversation_id.clone()),
+        ("X-Conversation-Request-ID", conversation_id.clone()),
+        ("X-Conversation-Message-ID", conversation_id),
+        ("X-Session-ID", uuid::Uuid::new_v4().simple().to_string()),
+        ("X-B3-TraceId", trace_id.clone()),
+        ("X-B3-SpanId", span_id.clone()),
+        ("X-B3-Sampled", "1".to_string()),
+        ("b3", format!("{trace_id}-{span_id}-1")),
+    ];
+    if let Some(account) = account_for_key(upstream_key) {
+        if let Some(uid) = account::get_str(&account, "uid") {
+            headers.push(("X-User-Id", uid));
+        }
+    }
+    headers
+}
 
 /// 支持的模型列表（与上游实测可用集合保持一致）。
 pub const SUPPORTED_MODELS: &[&str] = &[
@@ -108,6 +159,9 @@ fn default_db() -> Value {
             "mode": "local",
             "upstream_proxy": "",
             "auto_start": false,
+            "log_retention_days": DEFAULT_LOG_RETENTION_DAYS,
+            "log_retention_max_mb": DEFAULT_LOG_RETENTION_MAX_MB,
+            "log_content_enabled": true,
         }
     })
 }
@@ -349,6 +403,8 @@ fn merge_monotonic_fields(ours: &mut Value, disk: &Value) {
     if let Some(our_logs) = ours.get_mut("request_logs").and_then(Value::as_array_mut) {
         our_logs.retain(keep_entry);
     }
+    // settings 需在取得 request_logs 可变借用之前读出（同一 ours，避免借用冲突）。
+    let settings = ours.get("settings").cloned().unwrap_or(json!({}));
     let our_logs = ours
         .as_object_mut()
         .map(|root| {
@@ -376,10 +432,7 @@ fn merge_monotonic_fields(ours: &mut Value, disk: &Value) {
                 .partial_cmp(&right_ts)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        if our_logs.len() > REQUEST_LOG_KEEP {
-            let overflow = our_logs.len() - REQUEST_LOG_KEEP;
-            our_logs.drain(..overflow);
-        }
+        trim_request_logs(our_logs, &settings);
     }
     if cleared_marker > 0.0 {
         ours["logs_cleared_at"] = json!(cleared_marker);
@@ -554,7 +607,46 @@ pub fn clear_request_logs() {
     db.save();
 }
 
+/// 请求日志裁剪：固定条数 + 保留天数 + 体积上限（设置驱动，显式 0 = 不启用该维度）。
+///
+/// 调用方必须自行传入 settings——本函数常在持有 db 锁的上下文里运行，
+/// 不能再调 `get_settings()`（会二次加锁死锁）。
+fn trim_request_logs(logs: &mut Vec<Value>, settings: &Value) {
+    // 条数（固定硬上限，防止无界增长）。
+    if logs.len() > REQUEST_LOG_KEEP {
+        let overflow = logs.len() - REQUEST_LOG_KEEP;
+        logs.drain(..overflow);
+    }
+    // 保留天数。
+    let days = settings
+        .get("log_retention_days")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
+    if days > 0 {
+        let cutoff = now_secs() - days as f64 * 86400.0;
+        logs.retain(|entry| json_f64(entry.get("timestamp")).unwrap_or(0.0) >= cutoff);
+    }
+    // 体积上限（按序列化字节估算，从最旧开始删到达标）。
+    let max_mb = settings
+        .get("log_retention_max_mb")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_LOG_RETENTION_MAX_MB);
+    if max_mb > 0 {
+        let max_bytes = (max_mb as usize) * 1024 * 1024;
+        let mut size: usize = logs.iter().map(|entry| entry.to_string().len()).sum();
+        let mut drop_n = 0;
+        while size > max_bytes && drop_n < logs.len() {
+            size = size.saturating_sub(logs[drop_n].to_string().len());
+            drop_n += 1;
+        }
+        if drop_n > 0 {
+            logs.drain(..drop_n);
+        }
+    }
+}
+
 fn add_request_log(db: &mut ProxyDb, entry: Value) {
+    let settings = db.data.get("settings").cloned().unwrap_or(json!({}));
     let logs = db
         .data
         .as_object_mut()
@@ -564,10 +656,7 @@ fn add_request_log(db: &mut ProxyDb, entry: Value) {
         .as_array_mut()
         .unwrap();
     logs.push(entry);
-    if logs.len() > REQUEST_LOG_KEEP {
-        let overflow = logs.len() - REQUEST_LOG_KEEP;
-        logs.drain(..overflow);
-    }
+    trim_request_logs(logs, &settings);
 }
 
 fn add_request_log_entry(entry: Value) {
@@ -696,7 +785,47 @@ impl DailyTotals {
     }
 }
 
+/// 按字符截断（不是字节，避免 UTF-8 截出乱码）。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    text.chars().take(max).collect()
+}
+
+/// 日志中问答内容的最大字符数。
+const LOG_CONTENT_MAX_CHARS: usize = 500;
+
+/// 取请求 messages 中最后一条 user 消息的文本部分（多模态只取 text，图片等跳过）。
+fn extract_last_user_text(request: &Value) -> String {
+    let text_of = |message: &Value| -> String {
+        match message.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        }
+    };
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .map(text_of)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
 /// 一次请求结束的完整入账（上游 Key + 子 Key + 每日统计 + 日志），一次锁一次写盘。
+///
+/// `question` / `answer` 为已截断的问答文本（日志展开用），空串表示不记录。
 #[allow(clippy::too_many_arguments)]
 fn record_request_end(
     upstream_key_id: &str,
@@ -707,16 +836,20 @@ fn record_request_end(
     usage: &Value,
     duration_ms: u64,
     first_token_ms: u64,
+    question: &str,
+    answer: &str,
 ) {
     let (prompt, completion, total, cached, credit) = usage_numbers(usage);
 
     // 事件溯源：先记账本（权威来源），再更新 proxy_db 展示缓存（被冲掉可自愈）。
+    // model 用于子 Key 的模型维度统计（旧事件无此字段，折叠时归 "unknown"）。
     append_usage_event(&json!({
         "type": "end",
         "ts": now_secs(),
         "date": today_str(),
         "upstream": upstream_key_id,
         "sub": sub_key_id,
+        "model": model,
         "prompt": prompt,
         "completion": completion,
         "total": total,
@@ -796,23 +929,28 @@ fn record_request_end(
         bump("/sub_api_keys", "sub", sub_key_id);
     }
 
-    add_request_log(
-        &mut db,
-        json!({
-            "timestamp": now_secs(),
-            "sub_key_id": sub_key_id,
-            "sub_key_label": sub_key_label,
-            "main_key_id": upstream_key_id,
-            "main_key_label": upstream_label,
-            "model": model,
-            "event": "end",
-            "duration_ms": duration_ms,
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "credit": (credit * 10000.0).round() / 10000.0,
-            "first_token_ms": first_token_ms,
-        }),
-    );
+    let mut entry = json!({
+        "timestamp": now_secs(),
+        "sub_key_id": sub_key_id,
+        "sub_key_label": sub_key_label,
+        "main_key_id": upstream_key_id,
+        "main_key_label": upstream_label,
+        "model": model,
+        "event": "end",
+        "duration_ms": duration_ms,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "credit": (credit * 10000.0).round() / 10000.0,
+        "first_token_ms": first_token_ms,
+    });
+    // 问答内容（日志展开用）：只在非空时写入，失败日志不采集。
+    if !question.is_empty() {
+        entry["question"] = json!(question);
+    }
+    if !answer.is_empty() {
+        entry["answer"] = json!(answer);
+    }
+    add_request_log(&mut db, entry);
     db.save();
 }
 
@@ -845,8 +983,11 @@ fn usage_numbers(usage: &Value) -> (u64, u64, u64, u64, f64) {
     let total = json_u64(usage.get("total_tokens"))
         .filter(|total| *total > 0)
         .unwrap_or(prompt + completion);
+    // 兼容 OpenAI 风格的嵌套字段（kimi 系上游把缓存命中放在 prompt_tokens_details 里，
+    // 只读顶层会恒为 0，界面「缓存命中」因此不显示）。
     let cached = json_u64(usage.get("cached_tokens"))
         .or_else(|| json_u64(usage.get("prompt_cache_hit_tokens")))
+        .or_else(|| json_u64(usage.pointer("/prompt_tokens_details/cached_tokens")))
         .unwrap_or(0);
     let credit = json_f64(usage.get("credit")).unwrap_or(0.0);
     (prompt, completion, total, cached, credit)
@@ -918,6 +1059,8 @@ struct UsageFold {
     /// (key_id, date) → 当日累计。
     daily_upstream: HashMap<(String, String), KeyFold>,
     daily_sub: HashMap<(String, String), KeyFold>,
+    /// (sub_key_id, model) → 该子 Key 按模型的累计（模型维度统计用）。
+    sub_model: HashMap<(String, String), KeyFold>,
     /// (是否上游, key_id) → 清零时刻；不晚于它的该 Key 事件不计入。
     reset_floor: HashMap<(bool, String), f64>,
     /// 账本文件是否存在（不存在时 sync 不动 proxy_db 缓存，回退到旧计数口径）。
@@ -991,6 +1134,18 @@ fn fold_line(fold: &mut UsageFold, line: &str) {
                     }
                 }
             }
+            // 子 Key 模型维度基线（账本重写实入；旧版基线无此字段则跳过）。
+            if let Some(models) = entry.get("sub_model").and_then(Value::as_object) {
+                for (compound, totals) in models {
+                    let Some((key_id, model)) = compound.split_once('|') else {
+                        continue;
+                    };
+                    fold.sub_model
+                        .entry((key_id.to_string(), model.to_string()))
+                        .or_default()
+                        .merge_max(&KeyFold::from_json(totals));
+                }
+            }
         }
         Some("reset") => {
             let Some(key_id) = entry.get("key_id").and_then(Value::as_str) else {
@@ -1005,6 +1160,9 @@ fn fold_line(fold: &mut UsageFold, line: &str) {
             };
             keys.remove(key_id);
             daily.retain(|(id, _), _| id != key_id);
+            if !is_upstream {
+                fold.sub_model.retain(|(id, _), _| id != key_id);
+            }
             fold.reset_floor
                 .insert((is_upstream, key_id.to_string()), ts);
         }
@@ -1048,6 +1206,19 @@ fn fold_line(fold: &mut UsageFold, line: &str) {
                 if !date.is_empty() {
                     daily
                         .entry((key_id.to_string(), date.clone()))
+                        .or_default()
+                        .add(prompt, completion, total, cached, credit);
+                }
+                // 子 Key 模型维度：旧事件无 model 归 "unknown"；与上面的 floor 检查共用同一放行点。
+                if !is_upstream {
+                    let model = entry
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    fold.sub_model
+                        .entry((key_id.to_string(), model))
                         .or_default()
                         .add(prompt, completion, total, cached, credit);
                 }
@@ -1152,6 +1323,126 @@ fn usage_baseline() -> Value {
     })
 }
 
+/// 把折叠状态序列化为账本基线行（与 `usage_baseline` 同构，供账本重写实入）。
+fn fold_to_baseline(fold: &UsageFold) -> Value {
+    let totals_json = |t: &KeyFold| {
+        json!({
+            "used": t.used,
+            "prompt": t.prompt,
+            "completion": t.completion,
+            "total": t.total,
+            "cached": t.cached,
+            "credits": t.credits,
+        })
+    };
+    let key_totals = |keys: &HashMap<String, KeyFold>| -> serde_json::Map<String, Value> {
+        keys.iter()
+            .map(|(id, t)| (id.clone(), totals_json(t)))
+            .collect()
+    };
+    let compound_totals =
+        |keys: &HashMap<(String, String), KeyFold>| -> serde_json::Map<String, Value> {
+            keys.iter()
+                .map(|((a, b), t)| (format!("{a}|{b}"), totals_json(t)))
+                .collect()
+        };
+    json!({
+        "type": "baseline",
+        "ts": now_secs(),
+        "upstream": Value::Object(key_totals(&fold.upstream)),
+        "sub": Value::Object(key_totals(&fold.sub)),
+        "daily_upstream": Value::Object(compound_totals(&fold.daily_upstream)),
+        "daily_sub": Value::Object(compound_totals(&fold.daily_sub)),
+        "sub_model": Value::Object(compound_totals(&fold.sub_model)),
+    })
+}
+
+/// 账本保留策略（启动时执行）：把过期 / 超限事件**折叠进新基线**后重写
+/// proxy_usage.jsonl。绝不能直接删旧事件——那会让全量统计回退；
+/// 必须先折叠进基线（事件溯源设计见 USAGE_EVENTS_FILE 上方注释）。
+fn prune_usage_ledger() {
+    let settings = get_settings();
+    let days = settings
+        .get("log_retention_days")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
+    let max_mb = settings
+        .get("log_retention_max_mb")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_LOG_RETENTION_MAX_MB);
+    if days == 0 && max_mb == 0 {
+        return;
+    }
+    let path = usage_events_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let cutoff = if days > 0 {
+        now_secs() - days as f64 * 86400.0
+    } else {
+        // 不按天数清理时 cutoff 放到未来，事件全部保留（仅受体积约束）。
+        f64::MAX
+    };
+    let mut fold = UsageFold::default();
+    let mut kept: Vec<String> = Vec::new();
+    let mut pruned = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_baseline = entry.get("type").and_then(Value::as_str) == Some("baseline");
+        let ts = json_f64(entry.get("ts")).unwrap_or(0.0);
+        if is_baseline || ts < cutoff {
+            // 旧基线与过期事件一律折叠进新基线，不保留原文。
+            fold_line(&mut fold, line);
+            if !is_baseline {
+                pruned += 1;
+            }
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+    // 体积约束：从最旧事件开始继续折叠，直到文件体积达标。
+    if max_mb > 0 {
+        let max_bytes = (max_mb as usize) * 1024 * 1024;
+        let mut size: usize = kept.iter().map(|line| line.len() + 1).sum();
+        let mut drop_n = 0;
+        while size > max_bytes && drop_n < kept.len() {
+            size = size.saturating_sub(kept[drop_n].len() + 1);
+            fold_line(&mut fold, &kept[drop_n]);
+            drop_n += 1;
+        }
+        if drop_n > 0 {
+            pruned += drop_n;
+            kept.drain(..drop_n);
+        }
+    }
+    if pruned == 0 {
+        return;
+    }
+    // 原子重写：先写临时文件再改名，避免半途崩溃丢账本。
+    let mut content = format!("{}\n", fold_to_baseline(&fold));
+    for line in &kept {
+        content.push_str(line);
+        content.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    let written = std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, &path));
+    if written.is_ok() {
+        // 进程内折叠缓存的文件偏移已失效，重置后下次读取全量重折。
+        *usage_fold().lock().unwrap() = UsageFold::default();
+        add_request_log_entry(json!({
+            "timestamp": now_secs(),
+            "event": "log_prune",
+            "error": format!("日志保留策略：{pruned} 条过期/超限账本事件已折叠进基线"),
+        }));
+    }
+}
+
 /// 追加一条账本事件；文件不存在时先落基线快照（存量累计并入账本）。
 fn append_usage_event(entry: &Value) {
     let path = usage_events_path();
@@ -1253,6 +1544,58 @@ pub fn reset_sub_key_usage(key_id: &str) {
     );
     let mut db = lock_db();
     db.save();
+}
+
+/// 子 Key 的模型维度统计：总调用次数、各模型调用次数 / Token / 占比。
+///
+/// 数据来自事件账本折叠（权威源）；旧事件无 model 字段归 "unknown"。
+/// 占比保留两位小数（×100 后四舍五入到 0.01%）。
+pub fn sub_key_model_stats(key_id: &str) -> Value {
+    fold_usage_events();
+    let fold = usage_fold().lock().unwrap();
+    let mut models: Vec<(String, KeyFold)> = fold
+        .sub_model
+        .iter()
+        .filter(|((id, _), _)| id == key_id)
+        .map(|((_, model), totals)| (model.clone(), *totals))
+        .collect();
+    // 次数降序，次数相同按 Token 降序。
+    models.sort_by(|a, b| {
+        b.1.used
+            .cmp(&a.1.used)
+            .then_with(|| b.1.total.cmp(&a.1.total))
+    });
+    let total_count: u64 = models.iter().map(|(_, t)| t.used).sum();
+    let total_tokens: u64 = models.iter().map(|(_, t)| t.total).sum();
+    let pct = |part: u64, whole: u64| {
+        if whole > 0 {
+            (part as f64 * 10000.0 / whole as f64).round() / 100.0
+        } else {
+            0.0
+        }
+    };
+    let rows: Vec<Value> = models
+        .iter()
+        .map(|(model, t)| {
+            json!({
+                "model": model,
+                "count": t.used,
+                "total_tokens": t.total,
+                "prompt_tokens": t.prompt,
+                "completion_tokens": t.completion,
+                "cached_tokens": t.cached,
+                "credits": (t.credits * 10000.0).round() / 10000.0,
+                "count_pct": pct(t.used, total_count),
+                "token_pct": pct(t.total, total_tokens),
+            })
+        })
+        .collect();
+    json!({
+        "key_id": key_id,
+        "total_count": total_count,
+        "total_tokens": total_tokens,
+        "models": rows,
+    })
 }
 
 fn inc_u64(value: &mut Value, key: &str, delta: u64) {
@@ -1522,10 +1865,15 @@ pub async fn check_all_key_status() -> Value {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let upstream = upstream_url();
-        let result = proxy_http()
+        // 探测请求同样带官方渠道头，否则 11128 会让全部 Key 被误判 failed。
+        let mut probe_builder = proxy_http()
             .post(format!("{upstream}{UPSTREAM_CHAT_PATH}"))
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {api_key}"));
+        for (name, value) in channel_headers(&key) {
+            probe_builder = probe_builder.header(name, value);
+        }
+        let result = probe_builder
             .json(&json!({
                 "model": "auto",
                 "stream": true,
@@ -1993,6 +2341,50 @@ fn classify_error(status: u16, body: &str) -> Failover {
     }
 }
 
+/// 把上游错误体清洗成 OpenAI 风格 error JSON 字符串（返回给客户端用）。
+///
+/// 只取人类可读的 `msg`（400 时优先 `displayMsg.zh`，11128 的 msg 是英文内部文案），
+/// 剥离 `code`/`requestId` 等上游内部字段；绝不拼接上游 Key 的 label / key_id / api_key。
+/// 401/403 不透传上游 msg（避免泄露上游鉴权细节），维持通用文案。
+fn sanitize_upstream_error(status: u16, body_text: &str) -> String {
+    let parsed: Option<Value> = serde_json::from_str(body_text).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|body| body.get(name).and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    let msg = field("msg");
+    let msg_zh = parsed
+        .as_ref()
+        .and_then(|body| body.pointer("/displayMsg/zh"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (kind, message) = match status {
+        429 => (
+            "rate_limit_exceeded",
+            msg.or(msg_zh)
+                .unwrap_or_else(|| "请求频率超限，请稍后重试".to_string()),
+        ),
+        400 => (
+            "upstream_bad_request",
+            msg_zh
+                .or(msg)
+                .unwrap_or_else(|| "上游拒绝请求，可能是参数问题".to_string()),
+        ),
+        401 | 403 => (
+            "upstream_auth_error",
+            "上游认证失败，请检查上游 Key 是否有效".to_string(),
+        ),
+        _ => (
+            "upstream_error",
+            msg.or(msg_zh)
+                .unwrap_or_else(|| format!("上游返回错误（{status}）")),
+        ),
+    };
+    json!({"error": {"message": message, "type": kind}}).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // axum handlers
 // ---------------------------------------------------------------------------
@@ -2008,6 +2400,10 @@ pub fn proxy_router(mode: &str) -> Router {
         .route("/v1/", get(index_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/engines", get(engines_handler))
+        .route(
+            "/v1/key/info",
+            get(key_info_handler).options(options_handler),
+        )
         .route(
             "/v1/chat/completions",
             post(chat_completions_handler).options(options_handler),
@@ -2088,6 +2484,75 @@ async fn models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> 
 
 async fn engines_handler() -> Response {
     json_response(StatusCode::OK, json!({"object": "list", "data": []}))
+}
+
+/// GET /v1/key/info：子 Key 自查——限额 / 已用 / 支持模型。
+///
+/// 脱敏红线：只返回该子 Key 自身信息；不返回 allowed_key_ids 明细，
+/// 不暴露上游 Key 的 label / 余额 / 状态。透传模式无真实子 Key，按 404 处理。
+async fn key_info_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    let Some(sub_key) = authenticate(&state, &headers) else {
+        // 与 chat 一致：open 模式返回 401，本地模式避免触发客户端重登录用 503。
+        if state.mode.as_str() == "open" {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}),
+            );
+        }
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"message": "Service temporarily unavailable", "type": "server_error"}}),
+        );
+    };
+    if sub_key.get("key_id").and_then(Value::as_str) == Some("_passthrough_") {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": {"message": "Endpoint not found", "type": "not_found"}}),
+        );
+    }
+    let u64_of = |field: &str| sub_key.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let f64_of = |field: &str| sub_key.get(field).and_then(Value::as_f64).unwrap_or(0.0);
+    let allowed: Vec<String> = sub_key
+        .get("allowed_models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // 空 = 不限制，返回全量支持列表，客户端无需关心空数组语义。
+    let models: Vec<&str> = SUPPORTED_MODELS
+        .iter()
+        .copied()
+        .filter(|m| allowed.is_empty() || allowed.iter().any(|a| a == m))
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "object": "key.info",
+            "label": sub_key.get("label").and_then(Value::as_str).unwrap_or(""),
+            "limits": {
+                "max_usage": u64_of("max_usage"),
+                "max_tokens": u64_of("max_tokens"),
+                "max_credits": f64_of("max_credits"),
+                "rate_limit_rpm": u64_of("rate_limit_rpm"),
+            },
+            "usage": {
+                "used_count": u64_of("used_count"),
+                "total_prompt_tokens": u64_of("total_prompt_tokens"),
+                "total_completion_tokens": u64_of("total_completion_tokens"),
+                "total_tokens": u64_of("total_tokens"),
+                "total_cached_tokens": u64_of("total_cached_tokens"),
+                "total_credits": f64_of("total_credits"),
+            },
+            "allowed_models": models,
+            "allowed_all_models": allowed.is_empty(),
+            "limits_note": "limits 中 0 表示不限",
+        }),
+    )
 }
 
 async fn not_found_handler() -> Response {
@@ -2375,6 +2840,17 @@ async fn chat_completions_handler(
     let upstream = upstream_url();
     let target_url = format!("{upstream}{UPSTREAM_CHAT_PATH}");
 
+    // 日志问答内容开关（默认开）：关闭时 end 日志不写 question/answer。
+    let log_content_enabled = get_settings()
+        .get("log_content_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let question = if log_content_enabled {
+        truncate_chars(&extract_last_user_text(&request), LOG_CONTENT_MAX_CHARS)
+    } else {
+        String::new()
+    };
+
     let mut tried: HashSet<String> = HashSet::new();
     let mut same_key_retried: HashSet<String> = HashSet::new();
     let mut last_error = String::new();
@@ -2417,11 +2893,16 @@ async fn chat_completions_handler(
             .and_modify(|n| *n += 1)
             .or_insert(1);
 
-        let send_result = proxy_http()
+        // 官方渠道标识头：缺失会被上游网关判为「未批准渠道」（400 code 11128）。
+        let mut send_builder = proxy_http()
             .post(&target_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {api_key}"))
-            .header("X-Request-ID", uuid::Uuid::new_v4().simple().to_string())
+            .header("X-Request-ID", uuid::Uuid::new_v4().simple().to_string());
+        for (name, value) in channel_headers(&upstream_key) {
+            send_builder = send_builder.header(name, value);
+        }
+        let send_result = send_builder
             .json(&request)
             .timeout(Duration::from_secs(120))
             .send()
@@ -2532,21 +3013,18 @@ async fn chat_completions_handler(
 
             if failover == Failover::RetrySame && !same_key_retried.contains(&key_id) {
                 same_key_retried.insert(key_id.clone());
-                last_error = body_text;
+                last_error = sanitize_upstream_error(status, &body_text);
                 last_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
                 continue;
             }
             tried.insert(key_id.clone());
-            // 上游 4xx 认证错误不能原样转发给客户端（会触发重登录），统一转 502。
+            // 上游 4xx 认证错误不能原样转发给客户端（会触发重登录），统一转 502；
+            // 错误体统一清洗：透传可读 msg、剥离内部字段、不掺 Key 信息。
             last_status = match status {
                 401 | 403 | 400 => StatusCode::BAD_GATEWAY,
                 other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
             };
-            last_error = match status {
-                401 | 403 => json!({"error": {"message": "上游认证失败，请检查上游 Key 是否有效", "type": "upstream_auth_error"}}).to_string(),
-                400 => json!({"error": {"message": "上游拒绝请求，可能是参数问题", "type": "upstream_bad_request"}}).to_string(),
-                _ => body_text,
-            };
+            last_error = sanitize_upstream_error(status, &body_text);
             continue;
         }
 
@@ -2607,14 +3085,20 @@ async fn chat_completions_handler(
             let runtime = state.runtime.clone();
             let key_id_task = key_id.clone();
             let key_for_points = upstream_key.clone();
+            let question_task = question.clone();
             tokio::spawn(async move {
                 let mut scan = UsageScan::new();
+                // 同步聚合回复文本（日志 answer 用），与转发互不干扰。
+                let mut collector = SseCollector::default();
                 scan.feed(&first_text);
+                collector.feed(&first_text);
                 let mut client_gone = tx.send(Ok(first_chunk)).await.is_err();
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(bytes) => {
-                            scan.feed(&String::from_utf8_lossy(&bytes));
+                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            scan.feed(&text);
+                            collector.feed(&text);
                             if !client_gone && tx.send(Ok(bytes)).await.is_err() {
                                 client_gone = true;
                             }
@@ -2637,6 +3121,8 @@ async fn chat_completions_handler(
                     &scan.usage,
                     t0.elapsed().as_millis() as u64,
                     first_token_ms,
+                    &question_task,
+                    &truncate_chars(&collector.content, LOG_CONTENT_MAX_CHARS),
                 );
                 maybe_refresh_key_points(&runtime, &key_for_points);
             });
@@ -2656,33 +3142,22 @@ async fn chat_completions_handler(
 
         // 非流式：聚合完整 SSE 为标准 chat.completion JSON。
         let mut scan = UsageScan::new();
+        let mut collector = SseCollector::default();
         scan.feed(&first_text);
-        let mut content_parts: Vec<String> = Vec::new();
-        let mut reasoning_parts: Vec<String> = Vec::new();
-        let mut chat_id = String::new();
+        collector.feed(&first_text);
         let mut model_name = model.clone();
-        collect_sse_text(
-            &first_text,
-            &mut content_parts,
-            &mut reasoning_parts,
-            &mut chat_id,
-            &mut model_name,
-        );
         while let Some(item) = stream.next().await {
             match item {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).to_string();
                     scan.feed(&text);
-                    collect_sse_text(
-                        &text,
-                        &mut content_parts,
-                        &mut reasoning_parts,
-                        &mut chat_id,
-                        &mut model_name,
-                    );
+                    collector.feed(&text);
                 }
                 Err(_) => break,
             }
+        }
+        if !collector.model_name.is_empty() {
+            model_name = collector.model_name.clone();
         }
         dec_concurrent(&state.runtime, &key_id);
         reset_cooldown_count(&state.runtime, &key_id);
@@ -2695,6 +3170,8 @@ async fn chat_completions_handler(
             &scan.usage,
             t0.elapsed().as_millis() as u64,
             first_token_ms,
+            &question,
+            &truncate_chars(&collector.content, LOG_CONTENT_MAX_CHARS),
         );
         maybe_refresh_key_points(&state.runtime, &upstream_key);
 
@@ -2706,7 +3183,7 @@ async fn chat_completions_handler(
         return json_response(
             StatusCode::OK,
             json!({
-                "id": if chat_id.is_empty() { format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]) } else { chat_id },
+                "id": if collector.chat_id.is_empty() { format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]) } else { collector.chat_id.clone() },
                 "object": "chat.completion",
                 "created": now_secs() as u64,
                 "model": model_name,
@@ -2714,8 +3191,8 @@ async fn chat_completions_handler(
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": content_parts.join(""),
-                        "reasoning_content": reasoning_parts.join(""),
+                        "content": collector.content.clone(),
+                        "reasoning_content": collector.reasoning.clone(),
                     },
                     "finish_reason": "stop",
                 }],
@@ -2794,43 +3271,59 @@ fn log_entry(
     })
 }
 
-/// 非流式聚合：从 SSE 文本中提取 content / reasoning / id / model。
-fn collect_sse_text(
-    text: &str,
-    content_parts: &mut Vec<String>,
-    reasoning_parts: &mut Vec<String>,
-    chat_id: &mut String,
-    model_name: &mut String,
-) {
-    for line in text.lines() {
-        let Some(data) = line.trim().strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            return;
-        }
-        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if let Some(id) = chunk.get("id").and_then(Value::as_str) {
-            *chat_id = id.to_string();
-        }
-        if let Some(m) = chunk.get("model").and_then(Value::as_str) {
-            *model_name = m.to_string();
-        }
-        for choice in chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let delta = choice.get("delta").cloned().unwrap_or(json!({}));
-            if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                content_parts.push(content.to_string());
+/// 带跨 chunk 残留缓冲的 SSE 聚合器（content / reasoning / id / model）。
+///
+/// 取代逐 chunk 调用的 collect_sse_text：后者按「每次喂入的文本」按行解析，
+/// data 行被 TCP 分包截断时该行永远不完整、内容永久丢失（2026-10-06 实证：
+/// 大上下文流式请求日志「有问无答」——回复集中在少数几行，一行被截断就全丢）。
+/// 本结构与 UsageScan 同款思路：不完整行留在 tail 等下次拼接。
+#[derive(Default)]
+struct SseCollector {
+    tail: String,
+    content: String,
+    reasoning: String,
+    chat_id: String,
+    model_name: String,
+}
+
+impl SseCollector {
+    fn feed(&mut self, chunk: &str) {
+        self.tail.push_str(chunk);
+        while let Some(pos) = self.tail.find('\n') {
+            let line: String = self.tail.drain(..=pos).collect();
+            let Some(data) = line.trim().strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
             }
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                reasoning_parts.push(reasoning.to_string());
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                self.chat_id = id.to_string();
             }
+            if let Some(m) = chunk.get("model").and_then(Value::as_str) {
+                self.model_name = m.to_string();
+            }
+            for choice in chunk
+                .get("choices")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                    self.content.push_str(content);
+                }
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                    self.reasoning.push_str(reasoning);
+                }
+            }
+        }
+        // tail 防御性上限（畸形流永远不换行时不至于撑爆内存）。
+        if self.tail.len() > 65536 {
+            self.tail.clear();
         }
     }
 }
@@ -2874,6 +3367,8 @@ pub fn proxy_server_status() -> Value {
 /// 启动代理服务（local 绑 127.0.0.1，open 绑 0.0.0.0）。已运行则先停后启。
 pub async fn start_proxy_server(port: u16, mode: &str) -> Result<Value, String> {
     stop_proxy_server();
+    // 启动时执行一次日志保留策略（过期/超限账本事件折叠进基线后重写）。
+    prune_usage_ledger();
     let host = if mode == "open" {
         "0.0.0.0"
     } else {
@@ -2999,6 +3494,15 @@ mod tests {
         // credit 缺失 → 0；cached 兼容 prompt_cache_hit_tokens。
         let usage = json!({"prompt_tokens": 1, "prompt_cache_hit_tokens": 1});
         assert_eq!(usage_numbers(&usage), (1, 0, 1, 1, 0.0));
+
+        // cached 兼容 OpenAI 嵌套 prompt_tokens_details.cached_tokens（含数字字符串）。
+        let usage = json!({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 6}});
+        assert_eq!(usage_numbers(&usage).3, 6);
+        let usage = json!({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": "7"}});
+        assert_eq!(usage_numbers(&usage).3, 7);
+        // 顶层字段优先于嵌套字段。
+        let usage = json!({"prompt_tokens": 10, "cached_tokens": 3, "prompt_tokens_details": {"cached_tokens": 6}});
+        assert_eq!(usage_numbers(&usage).3, 3);
     }
 
     /// usage 采纳门槛同样容忍字符串数字：否则整个 usage 对象被丢弃，Token / 积分一并漏记。
@@ -3090,6 +3594,8 @@ mod tests {
                 {"timestamp": 3.0, "event": "end", "sub_key_id": "sk_a"},
                 {"timestamp": 1.0, "event": "end", "sub_key_id": "sk_a"}
             ],
+            // 本测试聚焦合并语义，显式关闭保留策略（否则合成时间戳会被按天数清掉）。
+            "settings": {"log_retention_days": 0, "log_retention_max_mb": 0},
         });
         // 另一进程的旧内存：计数整体更小、日志只有更早的一条、还有一个本进程已删除的 Key。
         let disk = json!({
@@ -3212,6 +3718,8 @@ mod tests {
         let mut ours = json!({
             "request_logs": [{"timestamp": 150.0, "event": "end", "note": "ours-new"}],
             "logs_cleared_at": 100.0,
+            // 合成时间戳是远古时间，关闭保留策略以免干扰墓碑语义断言。
+            "settings": {"log_retention_days": 0, "log_retention_max_mb": 0},
         });
         let disk = json!({
             "request_logs": [
@@ -3230,11 +3738,64 @@ mod tests {
         let mut ours = json!({
             "request_logs": [{"timestamp": 150.0, "event": "end"}],
             "logs_cleared_at": 100.0,
+            "settings": {"log_retention_days": 0, "log_retention_max_mb": 0},
         });
         let disk = json!({"request_logs": [], "logs_cleared_at": 200.0});
         merge_monotonic_fields(&mut ours, &disk);
         assert!(ours["request_logs"].as_array().unwrap().is_empty());
         assert_eq!(ours["logs_cleared_at"], json!(200.0));
+    }
+
+    /// 日志保留策略：超期条目被删除、近期条目保留；体积超限从最旧开始删；0 = 不限制。
+    #[test]
+    fn trim_request_logs_respects_days_and_size_limits() {
+        let now = now_secs();
+        let entry = |age_days: f64| json!({"timestamp": now - age_days * 86400.0, "event": "end", "note": "x".repeat(64)});
+        // 天数：7 天前的删掉，3 天内的保留；0 = 不按天数清理。
+        let mut logs = vec![entry(10.0), entry(3.0), entry(1.0)];
+        trim_request_logs(
+            &mut logs,
+            &json!({"log_retention_days": 7, "log_retention_max_mb": 0}),
+        );
+        assert_eq!(logs.len(), 2);
+        let mut logs = vec![entry(10.0), entry(3.0)];
+        trim_request_logs(
+            &mut logs,
+            &json!({"log_retention_days": 0, "log_retention_max_mb": 0}),
+        );
+        assert_eq!(logs.len(), 2, "0 = 不按天数清理");
+
+        // 体积：1000 条 × 约 1.2KB ≈ 1.2MB > 1MB 上限（条数维度不触发），
+        // 从最旧开始删到达标，最新的保留。生产日志按时间升序（最旧在前），此处同序构造。
+        let mut logs: Vec<Value> = (0..1000)
+            .rev()
+            .map(|i| json!({"timestamp": now - i as f64, "event": "end", "note": "x".repeat(1200) , "seq": i}))
+            .collect();
+        trim_request_logs(
+            &mut logs,
+            &json!({"log_retention_days": 0, "log_retention_max_mb": 1}),
+        );
+        assert!(logs.len() < 1000, "超体积应删最旧：剩余 {}", logs.len());
+        assert!(
+            logs.len() > 600,
+            "只删到达标为止，不应过度清理：剩余 {}",
+            logs.len()
+        );
+        assert_eq!(logs.last().unwrap()["seq"], json!(0));
+    }
+
+    /// SseCollector：data 行被 TCP 分包截断时不丢内容（逐字节喂入也应完整聚合）。
+    #[test]
+    fn sse_collector_survives_split_lines() {
+        let stream = "data: {\"id\":\"c1\",\"model\":\"glm-5.3\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"，世界\"}}]}\n\ndata: [DONE]\n";
+        let mut collector = SseCollector::default();
+        // 逐字符喂入，模拟最恶劣的分包（生产侧字节级分包由 from_utf8_lossy 先行归并）。
+        for ch in stream.chars() {
+            collector.feed(&ch.to_string());
+        }
+        assert_eq!(collector.content, "你好，世界");
+        assert_eq!(collector.chat_id, "c1");
+        assert_eq!(collector.model_name, "glm-5.3");
     }
 
     /// 重载收敛：磁盘是配置权威（另一实例改了上限 / 新增 Key），

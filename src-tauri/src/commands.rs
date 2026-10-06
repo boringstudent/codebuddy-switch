@@ -1131,3 +1131,9 @@ pub fn clear_proxy_logs() -> Value {
 pub fn get_proxy_daily_stats(category: String, key_id: String) -> Value {
     proxy::daily_stats(&category, &key_id)
 }
+
+/// GET /api/proxy/sub-keys/model-stats —— 子 Key 的模型维度统计（次数 / Token / 占比）。
+#[tauri::command]
+pub fn get_proxy_sub_key_model_stats(key_id: String) -> Value {
+    proxy::sub_key_model_stats(&key_id)
+}
