@@ -1513,9 +1513,9 @@ fn sync_usage_into_db(data: &mut Value, fold: &UsageFold) {
             let Some(key_id) = key.get("key_id").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(totals) = folds.get(key_id) else {
-                continue;
-            };
+            // fold 是权威：无记录 = 0（清零后该 Key 已被移出 fold，必须归零展示缓存，
+            // 否则旧累计会一直留在界面上）。
+            let totals = folds.get(key_id).copied().unwrap_or_default();
             key["used_count"] = json!(totals.used);
             key["total_prompt_tokens"] = json!(totals.prompt);
             key["total_completion_tokens"] = json!(totals.completion);
@@ -1852,8 +1852,7 @@ pub async fn refresh_all_key_points() -> Value {
     let keys: Vec<Value> = list_upstream_keys()
         .into_iter()
         .filter(|key| {
-            !key
-                .get("api_key")
+            !key.get("api_key")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .is_empty()
@@ -2229,7 +2228,10 @@ fn select_key(
         5 => {
             // 低分优先：剩余积分最少的 Key 优先（无积分信息排最后）；并发数为次级排序键。
             let concurrency = |k: &Value| {
-                concurrent_count(runtime, k.get("key_id").and_then(Value::as_str).unwrap_or(""))
+                concurrent_count(
+                    runtime,
+                    k.get("key_id").and_then(Value::as_str).unwrap_or(""),
+                )
             };
             available.sort_by(|a, b| {
                 remaining_points(a)
@@ -4047,5 +4049,30 @@ mod tests {
         let mut data = json!({"sub_api_keys": [{"key_id": "sk_a", "used_count": 42}]});
         sync_usage_into_db(&mut data, &UsageFold::default());
         assert_eq!(data["sub_api_keys"][0]["used_count"], json!(42));
+    }
+
+    /// 清零语义：fold 中无记录的 Key（被 reset 移出）必须把展示缓存归零，
+    /// 否则旧累计会一直留在界面与限额检查里（2026-10-07 实证清零后仍显示旧值）。
+    #[test]
+    fn sync_usage_into_db_zeroes_counters_for_keys_absent_from_fold() {
+        let fold = UsageFold {
+            ledger_present: true,
+            ..UsageFold::default()
+        };
+        let mut data = json!({
+            "sub_api_keys": [{"key_id": "sk_a", "used_count": 964, "total_tokens": 123456, "total_credits": 200.43, "max_credits": 280.0}],
+            "daily_stats": {"sub": {"sk_a": {"2026-10-07": {"count": 5, "credits": 1.0}}}},
+        });
+        sync_usage_into_db(&mut data, &fold);
+        let sk = &data["sub_api_keys"][0];
+        assert_eq!(sk["used_count"], json!(0));
+        assert_eq!(sk["total_tokens"], json!(0));
+        assert_eq!(sk["total_credits"], json!(0.0));
+        assert_eq!(sk["max_credits"], json!(280.0), "限额配置不动");
+        assert_eq!(
+            data["daily_stats"]["sub"]["sk_a"],
+            json!(Value::Null),
+            "清零后每日统计也一并移除"
+        );
     }
 }
