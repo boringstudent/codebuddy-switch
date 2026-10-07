@@ -3,7 +3,7 @@
 //! 功能对齐 antigravity-tools 的 proxy_server：
 //! - 上游 Key 池（从账号库导入，access_token 即上游凭据）
 //! - 子 API Key 管理与鉴权（本地模式支持透传，开放模式强制子 Key）
-//! - 请求路由：专一 / 临期优先 / 轮询 / 会话亲和四种调用模式
+//! - 请求路由：专一 / 临期优先 / 轮询 / 会话亲和 / 低分优先五种调用模式
 //! - SSE 流式转发（强制上游 stream + include_usage，usage 透传并统计）
 //! - 故障转移：429 冷却 / 额度耗尽 / 403 风控标记，最多尝试 3 个 Key
 //! - 请求日志与每日统计，JSON 文件持久化（`~/.wb-switch/proxy_db.json`）
@@ -468,12 +468,39 @@ pub fn list_upstream_keys() -> Vec<Value> {
 }
 
 pub fn list_sub_keys() -> Vec<Value> {
+    // 先惰性销毁到期子 Key（独立锁，勿与下面的读取嵌套）。
+    purge_expired_sub_keys();
     lock_db()
         .data
         .get("sub_api_keys")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+/// 惰性销毁到期子 Key（`expires_at` 秒级时间戳，0 / 缺省 = 无限）；有销毁才写盘。
+///
+/// 读取路径（列表 / 鉴权）都会经过，到期即删，无需后台定时器。
+pub fn purge_expired_sub_keys() -> usize {
+    let mut db = lock_db();
+    let now = now_secs();
+    let Some(keys) = db
+        .data
+        .get_mut("sub_api_keys")
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let before = keys.len();
+    keys.retain(|k| {
+        let expires_at = k.get("expires_at").and_then(Value::as_f64).unwrap_or(0.0);
+        expires_at <= 0.0 || expires_at > now
+    });
+    let removed = before - keys.len();
+    if removed > 0 {
+        db.save();
+    }
+    removed
 }
 
 pub fn add_upstream_key(key: Value) {
@@ -1816,21 +1843,37 @@ async fn query_key_points(key: &Value) -> Option<(f64, f64, Value)> {
     Some((remaining, total, json!(packages)))
 }
 
-/// 批量刷新所有上游 Key 积分。返回 {success, failed}。
+/// 批量并发刷新上限（积分 / 状态检测共用）：太小提速不明显，太大容易被上游风控。
+const BULK_QUERY_CONCURRENCY: usize = 8;
+
+/// 批量刷新所有上游 Key 积分（8 路并发）。返回 {success, failed}。
 pub async fn refresh_all_key_points() -> Value {
-    let keys = list_upstream_keys();
-    let mut success = 0;
-    let mut failed = 0;
-    for key in keys {
+    use futures_util::stream::{self, StreamExt};
+    let keys: Vec<Value> = list_upstream_keys()
+        .into_iter()
+        .filter(|key| {
+            !key
+                .get("api_key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .collect();
+    let results = stream::iter(keys.into_iter().map(|key| async move {
         let api_key = key
             .get("api_key")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if api_key.is_empty() {
-            continue;
-        }
-        match query_key_points(&key).await {
+        (api_key, query_key_points(&key).await)
+    }))
+    .buffer_unordered(BULK_QUERY_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut success = 0;
+    let mut failed = 0;
+    for (api_key, result) in results {
+        match result {
             Some((remaining, total, packages)) => {
                 sync_quota_to_key(&api_key, remaining, total, Some(&packages));
                 success += 1;
@@ -1841,8 +1884,16 @@ pub async fn refresh_all_key_points() -> Value {
     json!({"success": success, "failed": failed})
 }
 
-/// 批量检测上游 Key 风控状态（最轻量 chat 请求）。返回 {normal, abnormal, failed}。
+/// 单个 Key 状态探测结果。
+enum ProbeOutcome {
+    Normal,
+    Abnormal,
+    Failed,
+}
+
+/// 批量检测上游 Key 风控状态（最轻量 chat 请求，8 路并发）。返回 {normal, abnormal, failed}。
 pub async fn check_all_key_status() -> Value {
+    use futures_util::stream::{self, StreamExt};
     let keys: Vec<Value> = list_upstream_keys()
         .into_iter()
         .filter(|k| {
@@ -1852,10 +1903,7 @@ pub async fn check_all_key_status() -> Value {
             ) && k.get("api_key").and_then(Value::as_str).is_some()
         })
         .collect();
-    let mut normal = 0;
-    let mut abnormal = 0;
-    let mut failed = 0;
-    for key in keys {
+    let outcomes = stream::iter(keys.into_iter().map(|key| async move {
         let api_key = key
             .get("api_key")
             .and_then(Value::as_str)
@@ -1863,7 +1911,8 @@ pub async fn check_all_key_status() -> Value {
         let key_id = key
             .get("key_id")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         let upstream = upstream_url();
         // 探测请求同样带官方渠道头，否则 11128 会让全部 Key 被误判 failed。
         let mut probe_builder = proxy_http()
@@ -1886,20 +1935,36 @@ pub async fn check_all_key_status() -> Value {
             .timeout(Duration::from_secs(30))
             .send()
             .await;
-        match result {
+        let outcome = match result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
                 if status == 200 || status == 429 {
-                    normal += 1;
+                    ProbeOutcome::Normal
                 } else if status == 403 && body.contains("\"code\":11140") {
-                    update_upstream_key(key_id, &json!({"status": "abnormal"}));
-                    abnormal += 1;
+                    ProbeOutcome::Abnormal
                 } else {
-                    failed += 1;
+                    ProbeOutcome::Failed
                 }
             }
-            Err(_) => failed += 1,
+            Err(_) => ProbeOutcome::Failed,
+        };
+        (key_id, outcome)
+    }))
+    .buffer_unordered(BULK_QUERY_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut normal = 0;
+    let mut abnormal = 0;
+    let mut failed = 0;
+    for (key_id, outcome) in outcomes {
+        match outcome {
+            ProbeOutcome::Normal => normal += 1,
+            ProbeOutcome::Abnormal => {
+                update_upstream_key(&key_id, &json!({"status": "abnormal"}));
+                abnormal += 1;
+            }
+            ProbeOutcome::Failed => failed += 1,
         }
     }
     json!({"normal": normal, "abnormal": abnormal, "failed": failed})
@@ -2098,7 +2163,7 @@ fn reset_cooldown_count(runtime: &RuntimeState, key_id: &str) {
 
 /// 选择一个可用上游 Key。
 ///
-/// key_mode：1 专一（粘住一个用到不可用）/ 2 临期优先 / 3 轮询 / 4 会话亲和。
+/// key_mode：1 专一（粘住一个用到不可用）/ 2 临期优先 / 3 轮询 / 4 会话亲和 / 5 低分优先。
 fn select_key(
     runtime: &RuntimeState,
     model: &str,
@@ -2160,6 +2225,19 @@ fn select_key(
             let idx = rr.get(&pool_hash).copied().unwrap_or(0) % available.len();
             rr.insert(pool_hash, idx + 1);
             available.into_iter().nth(idx)
+        }
+        5 => {
+            // 低分优先：剩余积分最少的 Key 优先（无积分信息排最后）；并发数为次级排序键。
+            let concurrency = |k: &Value| {
+                concurrent_count(runtime, k.get("key_id").and_then(Value::as_str).unwrap_or(""))
+            };
+            available.sort_by(|a, b| {
+                remaining_points(a)
+                    .partial_cmp(&remaining_points(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| concurrency(a).cmp(&concurrency(b)))
+            });
+            available.into_iter().next()
         }
         4 => {
             let session_id = session_id_of(request);
@@ -2260,6 +2338,15 @@ fn earliest_expiring_ts(key: &Value) -> u64 {
         }
     }
     earliest.unwrap_or(u64::MAX)
+}
+
+/// 该 Key 的剩余积分（`points` 字段 "remaining/total" 的 remaining）；无积分信息排最后。
+fn remaining_points(key: &Value) -> f64 {
+    key.get("points")
+        .and_then(Value::as_str)
+        .and_then(|points| points.split('/').next())
+        .and_then(|remaining| remaining.trim().parse::<f64>().ok())
+        .unwrap_or(f64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -3883,6 +3970,17 @@ mod tests {
             r#"{"type":"baseline","upstream":{"ck_a":{"used":10,"prompt":100,"completion":50,"total":150,"cached":0,"credits":1.0}}}"#,
         );
         assert_eq!(fold.upstream["ck_a"].used, 12);
+    }
+
+    /// 低分优先排序键：解析 "remaining/total"；空值 / 坏格式排最后。
+    #[test]
+    fn remaining_points_parses_quota_and_unknown_sorts_last() {
+        assert_eq!(remaining_points(&json!({"points": "850/1000"})), 850.0);
+        assert_eq!(remaining_points(&json!({"points": "0/1000"})), 0.0);
+        assert_eq!(remaining_points(&json!({"points": " 12.5 /100"})), 12.5);
+        assert_eq!(remaining_points(&json!({"points": ""})), f64::MAX);
+        assert_eq!(remaining_points(&json!({"points": "abc"})), f64::MAX);
+        assert_eq!(remaining_points(&json!({})), f64::MAX);
     }
 
     /// 账本回写：proxy_db 的累计字段被其它进程冲掉后，按折叠结果自愈重建。

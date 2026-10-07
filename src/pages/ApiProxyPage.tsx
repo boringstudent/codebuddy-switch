@@ -28,6 +28,16 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -92,6 +102,7 @@ const KEY_MODES = [
   { value: 2, label: "2 - 临期优先", tip: "优先调用积分最快过期的 Key" },
   { value: 3, label: "3 - 轮询模式", tip: "每次请求轮换到下一个 Key" },
   { value: 4, label: "4 - 会话亲和", tip: "同一会话绑定同一上游 Key（TTL 1 小时）" },
+  { value: 5, label: "5 - 低分优先", tip: "优先使用剩余积分最少的上游 Key（无积分信息的排最后）" },
 ] as const;
 
 function fmtTokens(n: number | undefined): string {
@@ -131,6 +142,17 @@ function upstreamStatusBadge(status: string) {
 
 function keyModeLabel(mode: number): string {
   return KEY_MODES.find((m) => m.value === mode)?.label ?? KEY_MODES[0].label;
+}
+
+/** 到期剩余时间的短文案（expires_at 为秒级时间戳）。 */
+function formatExpireRemain(expiresAt: number): string {
+  const remainMs = expiresAt * 1000 - Date.now();
+  if (remainMs <= 0) return "已到期";
+  const days = Math.floor(remainMs / 86_400_000);
+  if (days >= 1) return `${days} 天后到期`;
+  const hours = Math.floor(remainMs / 3_600_000);
+  if (hours >= 1) return `${hours} 小时后到期`;
+  return `${Math.max(1, Math.floor(remainMs / 60_000))} 分钟后到期`;
 }
 
 function asError(cause: unknown): string {
@@ -271,6 +293,8 @@ export interface SubKeyFormData {
   max_credits: number;
   rate_limit_rpm: number;
   key_mode: number;
+  /** 到期时间（秒级时间戳），0 = 无限期 */
+  expires_at: number;
 }
 
 function SubKeyDialog({
@@ -295,6 +319,8 @@ function SubKeyDialog({
   const [maxCredits, setMaxCredits] = useState(0);
   const [rpm, setRpm] = useState(1000);
   const [keyMode, setKeyMode] = useState(1);
+  // 有效天数，0 = 无限期；到期自动销毁。
+  const [expireDays, setExpireDays] = useState(0);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -309,6 +335,11 @@ function SubKeyDialog({
     setMaxCredits(editKey?.max_credits ?? 0);
     setRpm(editKey?.rate_limit_rpm ?? 1000);
     setKeyMode(editKey?.key_mode ?? 1);
+    // 编辑时把绝对到期时间换算成剩余天数（向上取整，已过期按 1 天提示续期）。
+    const expiresAt = editKey?.expires_at ?? 0;
+    setExpireDays(
+      expiresAt > 0 ? Math.max(1, Math.ceil((expiresAt * 1000 - Date.now()) / 86_400_000)) : 0,
+    );
   }, [open, editKey]);
 
   const toggleSet = (set: Set<string>, value: string, checked: boolean) => {
@@ -332,6 +363,7 @@ function SubKeyDialog({
         max_credits: Math.max(0, maxCredits),
         rate_limit_rpm: Math.max(1, rpm),
         key_mode: keyMode,
+        expires_at: expireDays > 0 ? Date.now() / 1000 + expireDays * 86_400 : 0,
       });
       onOpenChange(false);
     } catch (cause) {
@@ -420,6 +452,16 @@ function SubKeyDialog({
                 onChange={(e) => setMaxCredits(Number(e.target.value) || 0)}
               />
               <p className="text-[11px] text-muted-foreground">累计积分消耗，0 = 不限</p>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label>有效天数</Label>
+              <Input
+                type="number"
+                min={0}
+                value={expireDays}
+                onChange={(e) => setExpireDays(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+              />
+              <p className="text-[11px] text-muted-foreground">0 = 无限期，到期自动销毁</p>
             </div>
             <div className="flex flex-col gap-1.5">
               <Label>限流 RPM</Label>
@@ -889,10 +931,13 @@ export default function ApiProxyPage() {
     }
   };
 
-  const resetSubKeyUsage = async (key: ProxySubKey) => {
-    if (!window.confirm(`确定清零「${key.label || key.key_id}」的累计用量（次数 / Token / 积分）吗？限额将重新起算。`)) {
-      return;
-    }
+  // 桌面 App（Tauri WebView）不支持 window.confirm（触发 plugin:dialog confirm 被 ACL 拒绝），改用 AlertDialog 确认。
+  const [resetTarget, setResetTarget] = useState<ProxySubKey | null>(null);
+
+  const confirmResetSubKeyUsage = async () => {
+    const key = resetTarget;
+    setResetTarget(null);
+    if (!key) return;
     try {
       await api.resetProxySubKeyUsage(key.key_id);
       toast.success("用量已清零");
@@ -1241,6 +1286,14 @@ export default function ApiProxyPage() {
                         <span className={cn("text-xs font-medium", k.is_active ? "text-emerald-600" : "text-amber-600")}>
                           {k.is_active ? "启用" : "禁用"}
                         </span>
+                        {(k.expires_at ?? 0) > 0 && (
+                          <div
+                            className="mt-0.5 text-[11px] text-muted-foreground"
+                            title={`到期自动销毁：${new Date((k.expires_at ?? 0) * 1000).toLocaleString()}`}
+                          >
+                            {formatExpireRemain(k.expires_at ?? 0)}
+                          </div>
+                        )}
                       </TableCell>
                       <TableCell className="max-w-32 truncate" title={k.allowed_models.join(", ") || "全部模型"}>
                         {k.allowed_models.length === 0 ? "全部" : `${k.allowed_models.length} 个模型`}
@@ -1313,7 +1366,7 @@ export default function ApiProxyPage() {
                             variant="ghost"
                             className="h-7 px-2 text-xs"
                             title="清零累计用量（次数 / Token / 积分），用于重新测试限额"
-                            onClick={() => void resetSubKeyUsage(k)}
+                            onClick={() => setResetTarget(k)}
                           >
                             清零
                           </Button>
@@ -1403,6 +1456,25 @@ export default function ApiProxyPage() {
         }}
         subKey={modelStatsKey}
       />
+      <AlertDialog
+        open={Boolean(resetTarget)}
+        onOpenChange={(open) => {
+          if (!open) setResetTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>清零累计用量？</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定清零「{resetTarget?.label || resetTarget?.key_id}」的累计用量（次数 / Token / 积分）吗？限额将重新起算。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void confirmResetSubKeyUsage()}>清零</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

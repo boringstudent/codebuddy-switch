@@ -1081,6 +1081,8 @@ pub fn create_proxy_sub_key(data: Value) -> Value {
         "used_count": 0,
         "rate_limit_rpm": data.get("rate_limit_rpm").and_then(Value::as_u64).unwrap_or(1000),
         "key_mode": data.get("key_mode").and_then(Value::as_u64).unwrap_or(1),
+        // 秒级时间戳，0 = 无限期；到期由读取路径惰性销毁。
+        "expires_at": data.get("expires_at").and_then(Value::as_f64).unwrap_or(0.0),
         "created_at": proxy::now_iso_string(),
         "total_prompt_tokens": 0,
         "total_completion_tokens": 0,

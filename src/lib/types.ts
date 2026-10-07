@@ -1036,8 +1036,10 @@ export interface ProxySubKey {
   max_credits?: number;
   used_count: number;
   rate_limit_rpm: number;
-  /** 1 专一 / 2 临期优先 / 3 轮询 / 4 会话亲和 */
+  /** 1 专一 / 2 临期优先 / 3 轮询 / 4 会话亲和 / 5 低分优先 */
   key_mode: number;
+  /** 到期时间（秒级时间戳），0 / 缺省 = 无限期；到期自动销毁 */
+  expires_at?: number;
   created_at?: string;
   /** 可调用的上游 Key 剩余积分总和（后端计算）。 */
   total_points?: number;
