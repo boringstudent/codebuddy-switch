@@ -144,6 +144,25 @@ function keyModeLabel(mode: number): string {
   return KEY_MODES.find((m) => m.value === mode)?.label ?? KEY_MODES[0].label;
 }
 
+/** 解析上游 Key 的剩余积分（points 为 "剩余/总量" 格式）；无积分信息返回 null。 */
+function remainingPointsOf(key: ProxyUpstreamKey): number | null {
+  if (!key.points) return null;
+  const value = Number(key.points.split("/")[0]?.trim());
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 上游 Key 按剩余积分排序；desc = 高→低，否则低→高；积分未知恒沉底。 */
+function sortByPoints(keys: ProxyUpstreamKey[], desc: boolean): ProxyUpstreamKey[] {
+  return [...keys].sort((a, b) => {
+    const ra = remainingPointsOf(a);
+    const rb = remainingPointsOf(b);
+    if (ra === null && rb === null) return 0;
+    if (ra === null) return 1;
+    if (rb === null) return -1;
+    return desc ? rb - ra : ra - rb;
+  });
+}
+
 /** 到期剩余时间的短文案（expires_at 为秒级时间戳）。 */
 function formatExpireRemain(expiresAt: number): string {
   const remainMs = expiresAt * 1000 - Date.now();
@@ -321,6 +340,8 @@ function SubKeyDialog({
   const [keyMode, setKeyMode] = useState(1);
   // 有效天数，0 = 无限期；到期自动销毁。
   const [expireDays, setExpireDays] = useState(0);
+  // 上游 Key 列表积分排序：true = 高→低，false = 低→高（积分未知恒沉底）。
+  const [pointsSortDesc, setPointsSortDesc] = useState(true);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -400,12 +421,24 @@ function SubKeyDialog({
             </div>
           </div>
           <div className="grid gap-1.5">
-            <Label>上游 Key（不选 = 全部上游 Key）</Label>
+            <div className="flex items-center justify-between">
+              <Label>上游 Key（不选 = 全部上游 Key）</Label>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[11px] text-muted-foreground"
+                title="切换上游 Key 列表的积分排序"
+                onClick={() => setPointsSortDesc((v) => !v)}
+              >
+                积分 {pointsSortDesc ? "高→低" : "低→高"}
+              </Button>
+            </div>
             <div className="max-h-28 overflow-y-auto rounded-md border p-2">
               {upstreamKeys.length === 0 ? (
                 <div className="text-xs text-muted-foreground">上游 Key 池为空</div>
               ) : (
-                upstreamKeys.map((k) => (
+                sortByPoints(upstreamKeys, pointsSortDesc).map((k) => (
                   <label key={k.key_id} className="flex cursor-pointer items-center gap-1.5 py-0.5 text-xs">
                     <Checkbox
                       checked={keyIds.has(k.key_id)}
