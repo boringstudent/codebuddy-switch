@@ -38,6 +38,16 @@ WorkBuddy 与 CodeBuddy IDE 多账号切换桌面 App（Tauri，仅支持 Window
 
 设置 →「支持工具」可分别开关 WorkBuddy 与 CodeBuddy IDE 入口；关闭后该端入口与状态轮询一并隐藏，不影响账号库与其它端。
 
+### 云端账号同步（GitHub Actions 每日签到）
+
+账号库可通过 EO 边缘函数持久化到私有 GitHub 仓库，供仓库内的每日签到工作流（`scripts/daily-checkin.mjs`）拉取与回写：
+
+- EO 函数代码在 `edge/eo-account-store.js`，部署步骤与环境变量说明见文件头注释（需要 `ACCESS_KEY` 与有私有仓库 Contents 读写权限的 `GITHUB_TOKEN`）；
+- 设置 →「云端账号同步」填入函数地址与访问 key，点「上传到云端」把账号库合并推送上去；账号有变动后再点一次即可；
+- 签到工作流运行时会先临期刷新 token，签到结束后把新 token 通过 `/accounts/merge` 回写仓库，`refresh_token` 轮换不会导致下次失效；
+- 工作流只需仓库 Secrets：`EO_ACCOUNTS_URL`（函数地址）与 `EO_ACCESS_KEY`（访问 key），失败结果会发邮件汇报；
+- 改动 EO 函数后可本地验证逻辑：`node scripts/test-eo-account-store.mjs`（内存 mock GitHub API，覆盖鉴权 / 合并 / 回写）。
+
 ## 使用
 
 1. **添加与导出账号**：账号页 →「OAuth 扫码添加」「导入备份」；「导出」可将勾选账号备份为 JSON

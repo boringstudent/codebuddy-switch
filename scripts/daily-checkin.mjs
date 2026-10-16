@@ -116,12 +116,38 @@ async function getCheckinStatus(account) {
     const code = Number(resp?.code ?? -1);
     if (code === 0 || code === 200) {
       const data = resp.data ?? {};
+      // /checkin-status 是旧活动接口：active=false 时数据全零且与真实活动无关，
+      // 不能据此判定「未签到」，否则提交后的假成功会漏签真实活动（Buddy加油站）。
+      if (suffix === '/checkin-status' && data.active === false) {
+        return { ok: false, error: '签到状态不可用（旧活动接口未激活）' };
+      }
       return { ok: true, todayCheckedIn: Boolean(data.today_checked_in ?? data.todayCheckedIn) };
     }
     if (isUnauthorized(resp)) return { ok: false, error: messageOf(resp), unauthorized: true };
     // 其他失败继续尝试下一个候选路径
   }
   return { ok: false, error: '查询签到状态失败' };
+}
+
+/**
+ * 提交后复核：daily-checkin 返回成功不代表真实活动已记录（旧接口会对未激活活动
+ * 也返回 code:0）。用权威接口 checkin-activity-status 再查一次，确认 today_checked_in。
+ * 网络抖动允许重查一次；复核接口本身失败时不推翻原结果（避免误报失败），只附注。
+ */
+async function verifyCheckedIn(account) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0) await sleep(2000);
+    const resp = await apiPost(`${API_BASE}${BILLING_PREFIX}/checkin-activity-status`, authHeaders(account));
+    const code = Number(resp?.code ?? -1);
+    if (code === 0 || code === 200) {
+      const data = resp.data ?? {};
+      return {
+        confirmed: Boolean(data.today_checked_in ?? data.todayCheckedIn),
+        reachable: true,
+      };
+    }
+  }
+  return { confirmed: null, reachable: false };
 }
 
 /** 提交签到（POST /daily-checkin）。「已签到」幂等提示按成功处理。 */
@@ -140,25 +166,38 @@ async function performCheckin(account) {
 async function checkinAccount(rawAccount) {
   let account = rawAccount;
   const name = account.nickname || account.phone || account.uid || account.id || '未知账号';
+  let tokensChanged = false;
+  const applyRefresh = (refreshed) => {
+    if (!refreshed) return false;
+    // refresh_token 可能轮换：任何 token 变化都标记，流程末尾统一回写 EO 持久化，
+    // 否则下次运行仍用旧 refresh_token，轮换失效后该账号会永久签到失败。
+    if (
+      refreshed.access_token !== account.access_token ||
+      refreshed.refresh_token !== account.refresh_token
+    ) {
+      tokensChanged = true;
+    }
+    account = refreshed;
+    return true;
+  };
 
   // 1) 临期（或无 expiresAt）且有 refresh_token：先刷新，避免拿过期 token 签到。
   const exp = Number(account.expiresAt);
   const stale = !Number.isFinite(exp) || exp <= Date.now() + REFRESH_WITHIN_MS;
   if (stale && account.refresh_token) {
-    const refreshed = await refreshAccountToken(account);
-    if (refreshed) account = refreshed;
+    applyRefresh(await refreshAccountToken(account));
   }
 
   // 2) 查状态 → 决定 已签 / 提交；401 时刷新一次重试。
   let status = await getCheckinStatus(account);
   if (status.unauthorized) {
-    const refreshed = await refreshAccountToken(account);
-    if (refreshed) {
-      account = refreshed;
+    if (applyRefresh(await refreshAccountToken(account))) {
       status = await getCheckinStatus(account);
     }
   }
-  if (status.ok && status.todayCheckedIn) return { name, result: 'already' };
+  if (status.ok && status.todayCheckedIn) {
+    return { name, result: 'already', account, tokensChanged };
+  }
   if (!status.ok && !status.unauthorized) {
     // 状态查询失败不一定是鉴权问题：保守起见仍尝试提交一次（daily-checkin 幂等）。
     // 与桌面端 decide_from_status 的 statusUnsupported 分支同策略。
@@ -167,13 +206,52 @@ async function checkinAccount(rawAccount) {
   // 3) 提交签到；401 刷新重试一次。
   let outcome = await performCheckin(account);
   if (outcome.unauthorized) {
-    const refreshed = await refreshAccountToken(account);
-    if (refreshed) {
-      account = refreshed;
+    if (applyRefresh(await refreshAccountToken(account))) {
       outcome = await performCheckin(account);
     }
   }
-  return { name, ...outcome };
+
+  // 4) 提交返回成功/已签到后复核真实活动状态，杜绝「显示成功但实际未签到」。
+  if (outcome.result === 'success' || outcome.result === 'already') {
+    const verify = await verifyCheckedIn(account);
+    if (verify.confirmed === false) {
+      return {
+        name,
+        result: 'error',
+        error: '提交后复核未生效（真实活动仍未签到）',
+        account,
+        tokensChanged,
+      };
+    }
+    if (verify.confirmed === null) {
+      outcome = { ...outcome, message: `${outcome.message || ''}（复核接口不可达，结果未二次确认）`.trim() };
+    }
+  }
+  return { name, ...outcome, account, tokensChanged };
+}
+
+/** 把刷新过 token 的账号回写 EO（POST /accounts/merge，按 id 合并后持久化到私有仓库）。 */
+async function writeBackRefreshedAccounts(changed) {
+  if (!changed.length) return;
+  try {
+    const resp = await fetch(`${EO_ACCOUNTS_URL}/accounts/merge`, {
+      method: 'POST',
+      headers: {
+        'X-Access-Key': EO_ACCESS_KEY,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(changed),
+    });
+    const data = await resp.json().catch(() => null);
+    if (resp.ok && data?.ok) {
+      console.log(`已回写 ${changed.length} 个账号的新 token 到云端账号仓库`);
+    } else {
+      console.error(`回写云端账号仓库失败：HTTP ${resp.status} ${data?.error || ''}`.trim());
+    }
+  } catch (error) {
+    console.error(`回写云端账号仓库失败：${String(error?.message || error)}`);
+  }
 }
 
 async function fetchAccounts() {
@@ -203,9 +281,11 @@ async function main() {
   let already = 0;
   let failed = 0;
   const report = [];
+  const changedAccounts = [];
   for (const account of accounts) {
     try {
       const outcome = await checkinAccount(account);
+      if (outcome.tokensChanged && outcome.account) changedAccounts.push(outcome.account);
       if (outcome.result === 'success') {
         success += 1;
         console.log(`[成功] ${outcome.name}`);
@@ -229,6 +309,8 @@ async function main() {
   }
 
   console.log(`签到完成：成功 ${success}，已签 ${already}，失败 ${failed}`);
+  // 回写本次刷新出的新 token，避免 refresh_token 轮换后下次失效。
+  await writeBackRefreshedAccounts(changedAccounts);
   await sendReportMail({ success, already, failed, report });
   if (failed > 0) process.exit(1);
 }

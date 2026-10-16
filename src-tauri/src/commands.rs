@@ -8,10 +8,10 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session,
-    codebuddy_ide_session_sync, config, credit_usage, credits, error_log, export_import, limits,
-    notifications, oauth, process, proxy, rate_limit_events, rate_limit_hook, refresh, session,
-    switch, token_stats, travel, variant::WbVariant, vscode_session,
+    account, auth_file, checkin, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session, config,
+    credit_usage, credits, error_log, export_import, limits, notifications, oauth, process, proxy,
+    rate_limit_events, rate_limit_hook, refresh, session, switch, token_stats, travel,
+    variant::WbVariant, vscode_session,
 };
 
 #[derive(Serialize)]
@@ -134,25 +134,6 @@ pub async fn list_codebuddy_ide_sessions() -> Result<Value, String> {
         .map_err(|error| format!("列出 CodeBuddy IDE 会话失败: {error}"))
 }
 
-/// POST /api/codebuddy-cn-ide/session-links —— 预览「当前 IDE 账号 → 目标账号」可同步的关联会话。
-///
-/// 只读：每组的 `defaultChecked` 与 `availableModes` 是前端勾选权限的唯一来源。
-/// async + spawn_blocking：会扫描会话目录并读取正文，避免阻塞 UI。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn codebuddy_ide_session_links_preview(
-    target_account_id: String,
-) -> Result<Value, String> {
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        codebuddy_ide_session_sync::links_preview(&target)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 /// POST /api/codebuddy-cn-ide/detect —— 读取本机 CN IDE 当前登录并尝试匹配账号库。
 ///
 /// async + spawn_blocking：会通过 Keychain/secret 读取子进程，避免阻塞主线程。
@@ -217,25 +198,6 @@ pub async fn list_codebuddy_intl_ide_sessions() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(codebuddy_ide_session::list_current_intl_ide_sessions)
         .await
         .map_err(|error| format!("列出 CodeBuddy IDE 会话失败: {error}"))
-}
-
-/// POST /api/codebuddy-ide/session-links —— 预览「当前国际版 IDE 账号 → 目标账号」可同步的关联会话。
-///
-/// 只读：每组的 `defaultChecked` 与 `availableModes` 是前端勾选权限的唯一来源。
-/// async + spawn_blocking：会扫描会话目录并读取正文，避免阻塞 UI。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn codebuddy_intl_ide_session_links_preview(
-    target_account_id: String,
-) -> Result<Value, String> {
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        codebuddy_ide_session_sync::links_preview_intl(&target)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -427,153 +389,6 @@ pub fn list_sessions(variant: Option<String>) -> Value {
     }
 }
 
-/// GET /api/sessions/account —— 指定账号名下的会话列表（会话管理页源账号视角）。
-///
-/// `client` 缺省 workbuddy（读 WorkBuddy 数据库）；`vscodeExt` 改读插件数据仓。
-#[tauri::command(rename_all = "camelCase")]
-pub fn list_account_sessions(account_id: String, client: Option<String>) -> Result<Value, String> {
-    if account_id.trim().is_empty() {
-        return Err("缺少 accountId".to_string());
-    }
-    let account = account::find_account(&account_id).ok_or("账号不存在")?;
-    match session::SessionClient::parse(client.as_deref().unwrap_or("workbuddy"))? {
-        session::SessionClient::VscodeExt => {
-            let uid = account::get_str(&account, "uid")
-                .map(|uid| uid.trim().to_string())
-                .filter(|uid| !uid.is_empty())
-                .ok_or("账号缺少 uid")?;
-            Ok(vscode_session::list_vscode_sessions(&uid))
-        }
-        session::SessionClient::Workbuddy => Ok(session::list_sessions_for_account(&account)),
-        session::SessionClient::CodebuddyIde => Err("当前客户端暂不支持列出账号会话".to_string()),
-    }
-}
-
-/// POST /api/sessions/copy —— 把勾选会话复制到指定账号（路径 B）。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn copy_sessions(
-    target_account_id: String,
-    session_ids: Vec<String>,
-) -> Result<Value, String> {
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    if session_ids.is_empty() {
-        return Err("缺少 sessionIds".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        // 档位取目标账号自身（copy_sessions_for_switch 内部判定）。
-        session::copy_sessions_for_switch(&target, &session_ids)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// POST /api/sessions/copy-cross —— 跨档复制：源与目标账号都显式给出（会话管理页用）。
-///
-/// 与 `copy_sessions` 同形，只多一个 `sourceAccountId`：源 uid 取自该账号，
-/// 不再从目标档登录态读取，支持国内版 ↔ 国际版。写入侧仍以目标账号为准。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn copy_sessions_cross(
-    source_account_id: String,
-    target_account_id: String,
-    session_ids: Vec<String>,
-) -> Result<Value, String> {
-    if source_account_id.trim().is_empty() {
-        return Err("缺少 sourceAccountId".to_string());
-    }
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    if session_ids.is_empty() {
-        return Err("缺少 sessionIds".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        session::copy_sessions_cross(&source, &target, &session_ids)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// 预览「当前账号 → 目标账号」的关联会话同步项（桌面端 command）。
-///
-/// 只读：返回 `supported / storeStatus / groups`，其中每组的 `defaultChecked` 与
-/// `availableModes` 是前端勾选权限的唯一来源，前端不得自行扩大。
-/// `variant` 缺省取目标账号自身档位：来源 uid 从该档位的登录态读取，目标与来源必须在
-/// 同一档位内比较（与 `copy_sessions` 的档位约定一致）。与 `POST /api/session-links/preview` 同形。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn session_links_preview(
-    target_account_id: String,
-    variant: Option<String>,
-) -> Result<Value, String> {
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        let variant = variant
-            .as_deref()
-            .map(|raw| WbVariant::parse(Some(raw)))
-            .unwrap_or_else(|| account::variant_of(&target));
-        session::session_links_preview(variant, &target)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// POST /api/session-links/preview-cross —— 预览「显式来源账号 → 显式目标账号」（跨档支持）。
-///
-/// 与 `session_links_preview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn session_links_preview_cross(
-    source_account_id: String,
-    target_account_id: String,
-) -> Result<Value, String> {
-    if source_account_id.trim().is_empty() {
-        return Err("缺少 sourceAccountId".to_string());
-    }
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        session::session_links_preview_cross(&source, &target)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// POST /api/session-sync/cross —— 把显式来源账号的新增同步到显式目标账号（会话管理页）。
-///
-/// `syncSelections` 与切号弹窗同形（core 校验缺 groupId / previewToken / mode）；
-/// 跨档支持：源正文按源档读取，写入侧仍以目标账号为准。
-#[tauri::command(rename_all = "camelCase")]
-pub async fn session_sync_cross(
-    source_account_id: String,
-    target_account_id: String,
-    sync_selections: Value,
-) -> Result<Value, String> {
-    if source_account_id.trim().is_empty() {
-        return Err("缺少 sourceAccountId".to_string());
-    }
-    if target_account_id.trim().is_empty() {
-        return Err("缺少 targetAccountId".to_string());
-    }
-    // 入参形状由 core 校验：缺字段/未知模式一律拒绝，这里只做透传。
-    let selections = session::parse_sync_selections(Some(&sync_selections))?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
-        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        session::sync_sessions_cross(&source, &target, &selections)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 // ---------------------------------------------------------------------------
 // 阶段 3：签到 + token 刷新
 // ---------------------------------------------------------------------------
@@ -761,6 +576,64 @@ pub async fn refresh_account_token(account_id: String) -> Result<Value, String> 
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
     let fresh = refresh::refresh_account_token(acc).await;
     Ok(account::account_meta(&fresh))
+}
+
+/// POST /api/refresh-all —— 一键刷新全部账号 token（逐个刷新，返回汇总）。
+#[tauri::command]
+pub async fn refresh_all_accounts() -> Result<Value, String> {
+    Ok(refresh::refresh_all_accounts().await)
+}
+
+/// GET /api/auto-refresh/config —— 定时刷新配置。
+#[tauri::command]
+pub fn get_auto_refresh_config() -> Value {
+    refresh::load_auto_refresh_config()
+}
+
+/// POST /api/auto-refresh/config —— 保存定时刷新配置（合并写）。
+#[tauri::command]
+pub fn save_auto_refresh_config(config: Value) -> Value {
+    refresh::save_auto_refresh_config(&config)
+}
+
+/// GET /api/proxy/sites —— 服务站点列表（管理端）。
+#[tauri::command]
+pub fn list_proxy_sites() -> Value {
+    json!({"sites": proxy::list_sites()})
+}
+
+/// POST /api/proxy/sites —— 保存服务站点列表（覆盖式；逐项校验名称与 URL）。
+#[tauri::command]
+pub fn save_proxy_sites(sites: Value) -> Result<Value, String> {
+    proxy::save_sites(&sites)
+}
+
+// ---------------------------------------------------------------------------
+// 模型目录（模型管理页）
+// ---------------------------------------------------------------------------
+
+/// GET /api/model-catalog —— 当前模型目录（含自动更新配置）。
+#[tauri::command]
+pub fn get_model_catalog() -> Value {
+    wb_switch_core::modules::model_catalog::load_catalog()
+}
+
+/// POST /api/model-catalog/refresh —— 立即从 CodeBuddy CN API 拉取模型列表。
+#[tauri::command]
+pub async fn refresh_model_catalog() -> Value {
+    wb_switch_core::modules::model_catalog::refresh_catalog().await
+}
+
+/// POST /api/model-catalog/refresh-cache —— 从客户端产品配置缓存读取服务器原样下发的完整模型参数（不联网）。
+#[tauri::command]
+pub fn refresh_model_catalog_client_cache() -> Value {
+    wb_switch_core::modules::model_catalog::refresh_catalog_from_client_cache()
+}
+
+/// POST /api/model-catalog/config —— 保存自动更新配置（auto_update / update_interval_hours）。
+#[tauri::command]
+pub fn save_model_catalog_config(config: Value) -> Value {
+    wb_switch_core::modules::model_catalog::save_catalog_config(&config)
 }
 
 /// 启动当前应用的新进程并退出旧进程，用于更新安装完成后的立即重启。
@@ -1113,6 +986,19 @@ pub fn delete_proxy_sub_key(key_id: String) -> Value {
 pub fn reset_proxy_sub_key_usage(key_id: String) -> Value {
     proxy::reset_sub_key_usage(&key_id);
     json!({ "ok": true })
+}
+
+/// POST /api/proxy/export-all —— 一键导出全部数据（账号库 + 代理设置 + 两类 Key + 请求日志）到指定路径。
+#[tauri::command]
+pub fn export_all_data(path: String) -> Result<Value, String> {
+    proxy::export_all_data_to_path(&path).map(|path| json!({ "ok": true, "path": path }))
+}
+
+/// POST /api/proxy/import-all —— 从备份文件一键导入（账号按 uid 合并，Key 去重追加）。
+#[tauri::command]
+pub fn import_all_data(path: String) -> Result<Value, String> {
+    let result = proxy::import_all_data_from_path(&path)?;
+    Ok(json!({ "ok": true, "result": result }))
 }
 
 /// GET /api/proxy/logs —— 请求日志（since 之后，最多 limit 条）。

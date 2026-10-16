@@ -273,11 +273,19 @@ pub fn clear_codebuddy_ide_app_cache() {
 // 签到配置 / 日志（对照 server.py load/save_checkin_config / load/save/add_checkin_log）
 // ---------------------------------------------------------------------------
 
+/// 每日自动签到的默认触发时刻（本地时区）：`00:10`。
+///
+/// 调度按「时间段窗口」工作：窗口 `[00:10, 00:11)` 长度为 1 分钟，账号抽签分钟恒为
+/// 窗口起点，因此全部账号每天在 00:10 触发，而不是分散在一段窗口里。
+const DEFAULT_CHECKIN_START: &str = "00:10";
+const DEFAULT_CHECKIN_END: &str = "00:11";
+
 /// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
 ///
 /// `enabled` 默认关闭：全新安装需用户在设置页显式开启；已有用户在
 /// [`load_checkin_config`] 中沿用历史默认（开启），升级不改其状态。
-/// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
+/// `checkin_start` / `checkin_end` 默认 `00:10` / `00:11` = 每日 00:10 触发；
+/// 用户在设置页显式清空后为空串 = 不限制签到时间段。
 pub fn default_checkin_config() -> Value {
     checkin_config_with_enabled(false)
 }
@@ -291,8 +299,10 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
     json!({
         "enabled": enabled,
         "excluded_account_ids": [],
-        "checkin_start": "",
-        "checkin_end": "",
+        "checkin_start": DEFAULT_CHECKIN_START,
+        "checkin_end": DEFAULT_CHECKIN_END,
+        // false = 用户从未在设置页设置过时间段，升级后沿用默认触发时刻（每日 00:10）。
+        "checkin_window_set": false,
         "start_hour": 6,
         "end_hour": 12,
         "keepalive_days": 0,
@@ -347,6 +357,12 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
             merged[key] = json!(value);
         }
     }
+    // 时间段：只有用户显式设置过（含清空 = 不限制）才尊重落盘值；否则保持默认
+    // 触发时刻（每日 00:10），这样历史配置升级后统一按新节奏触发。
+    if map.get("checkin_window_set").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    merged["checkin_window_set"] = json!(true);
     // 时间段保存归一化：合法值零填充后落盘，非法/非字符串归一为空串（= 不限制）。
     for key in ["checkin_start", "checkin_end"] {
         let normalized = map
@@ -360,9 +376,19 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
 }
 
 /// 以新默认值为基线合并（保存路径）。
+///
+/// 调用方只要带了时间段字段就视为「用户显式设置过」：之后读取时不再用默认 00:10
+/// 覆盖其值（清空也保留，语义为不限制）。
 fn merge_checkin_config(input: &Value) -> Value {
     let mut merged = default_checkin_config();
-    apply_checkin_config(&mut merged, input);
+    let patched = if input.get("checkin_start").is_some() || input.get("checkin_end").is_some() {
+        let mut p = input.clone();
+        p["checkin_window_set"] = json!(true);
+        p
+    } else {
+        input.clone()
+    };
+    apply_checkin_config(&mut merged, &patched);
     merged
 }
 
@@ -1241,8 +1267,11 @@ mod tests {
             let resolved = resolve_checkin_config(Some(&input), existing_install);
             assert_eq!(resolved["enabled"], json!(existing_install));
             assert_eq!(resolved["excluded_account_ids"], json!(["account-a"]));
-            // 保存已解析配置后，新老安装均保留开关状态和账号排除列表。
-            assert_eq!(merge_checkin_config(&resolved), resolved);
+            // 保存已解析配置后，新老安装均保留开关状态和账号排除列表；
+            // 整份配置回写会把时间段标记为「已显式设置」（值仍为默认 00:10）。
+            let mut expected = resolved.clone();
+            expected["checkin_window_set"] = json!(true);
+            assert_eq!(merge_checkin_config(&resolved), expected);
         }
     }
 
@@ -1260,7 +1289,8 @@ mod tests {
             existing.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
         );
-        assert_eq!(existing.get("checkin_start"), Some(&json!("")));
+        // 未显式设置过时间段 → 沿用每日 00:10 的默认触发时刻。
+        assert_eq!(existing.get("checkin_start"), Some(&json!("00:10")));
 
         // 显式值优先于痕迹。
         for existing_install in [false, true] {
@@ -1447,10 +1477,27 @@ mod tests {
     }
 
     #[test]
-    fn checkin_window_defaults_to_unset_and_normalizes_on_save() {
+    fn checkin_window_defaults_to_daily_trigger_and_normalizes_on_save() {
+        // 默认 = 每日 00:10 触发（单分钟窗口，抽签分钟恒为 10）。
         let defaults = default_checkin_config();
-        assert_eq!(defaults.get("checkin_start"), Some(&json!("")));
-        assert_eq!(defaults.get("checkin_end"), Some(&json!("")));
+        assert_eq!(defaults.get("checkin_start"), Some(&json!("00:10")));
+        assert_eq!(defaults.get("checkin_end"), Some(&json!("00:11")));
+
+        // 历史配置（未显式设置过时间段）升级后同样按 00:10 触发。
+        let upgraded = resolve_checkin_config(
+            Some(&json!({"checkin_start": "", "checkin_end": "", "enabled": true})),
+            true,
+        );
+        assert_eq!(upgraded.get("checkin_start"), Some(&json!("00:10")));
+        assert_eq!(upgraded.get("checkin_end"), Some(&json!("00:11")));
+
+        // 用户显式清空 → 尊重其选择（不限制）。
+        let cleared =
+            merge_checkin_config(&json!({"checkin_start": "", "checkin_end": "", "enabled": true}));
+        assert_eq!(
+            resolve_checkin_config(Some(&cleared), true).get("checkin_start"),
+            Some(&json!(""))
+        );
 
         // 合法值零填充后落盘。
         let merged = merge_checkin_config(&json!({
@@ -1463,8 +1510,8 @@ mod tests {
 
     #[test]
     fn checkin_window_invalid_values_normalize_to_empty_and_keep_other_fields() {
-        // 缺失 → 空串。
-        let missing = merge_checkin_config(&json!({}));
+        // 显式带字段但取值非法 → 空串（用户已设置过，不再回落到默认时刻）。
+        let missing = merge_checkin_config(&json!({"checkin_start": "", "checkin_end": ""}));
         assert_eq!(missing.get("checkin_start"), Some(&json!("")));
         assert_eq!(missing.get("checkin_end"), Some(&json!("")));
 

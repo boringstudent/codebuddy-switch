@@ -195,6 +195,7 @@ export default function AccountsPage() {
   const [codebuddyIdeSwitchAccount, setCodebuddyIdeSwitchAccount] = useState<AccountMeta | null>(null);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
+  const [refreshingAll, setRefreshingAll] = useState(false);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
   /** 当前档位下的账号：列表、计数、签到、积分等一律只作用于当前档位。 */
@@ -515,6 +516,28 @@ export default function AccountsPage() {
     }
   }
 
+  /** 一键刷新全部账号 token：逐个刷新（含未到期），结果汇总成 toast。 */
+  async function onRefreshAllTokens() {
+    if (refreshingAll || visibleAccounts.length === 0) return;
+    setRefreshingAll(true);
+    try {
+      const res = await api.refreshAllAccounts();
+      const failedNames = res.results.filter((r) => r.status === "failed").map((r) => r.name);
+      if (res.failed > 0) {
+        toast.error(`刷新完成：${res.ok} 成功 / ${res.failed} 失败`, {
+          description: failedNames.slice(0, 5).join("、") + (failedNames.length > 5 ? " 等" : ""),
+        });
+      } else {
+        toast.success(`全部刷新成功（${res.ok} 个账号）`);
+      }
+      void fetchAll();
+    } catch (e) {
+      toast.error("批量刷新失败", { description: api.asError(e) });
+    } finally {
+      setRefreshingAll(false);
+    }
+  }
+
   /** 刷新附带的签到遵守账号开关与签到时间段；所有账号照常刷新积分，提示实际忽略/未到时间段数量。 */
   async function onRefreshCredits() {
     if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
@@ -689,6 +712,16 @@ export default function AccountsPage() {
             </Button>
             <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
               <FileDown />导出
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9 px-2.5"
+              disabled={refreshingAll || visibleAccounts.length === 0}
+              title="逐个刷新全部账号的 token（含未到期账号）"
+              onClick={() => void onRefreshAllTokens()}
+            >
+              <RefreshCw className={refreshingAll ? "animate-spin" : undefined} />一键刷新
             </Button>
           </div>
         </div>

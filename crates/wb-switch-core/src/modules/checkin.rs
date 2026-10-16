@@ -10,7 +10,8 @@
 //!
 //! 时间段（`checkin_start` / `checkin_end`，本地时区）：窗口生效时，每个账号每天在
 //! 窗口内按 (本地日期, 账号 id) 确定性抽一个目标分钟；只有到点未办的账号才发请求，
-//! 未到点整轮不发任何请求。窗口未生效（字段为空/非法）时节奏、payload 与日志
+//! 未到点整轮不发任何请求。默认窗口为 `00:10`–`00:11`，长度 1 分钟 → 抽签分钟恒为
+//! 10，即**每日 00:10 触发**；用户清空时间段后窗口不生效，节奏、payload 与日志
 //! 行为与既有实现逐字一致。
 //!
 //! 账号页「刷新并签到」按 `respect_window=true` 调用 `run_checkin_all`：窗口生效且
@@ -32,8 +33,8 @@ use crate::modules::account::{
     account_display_name, build_auth_headers, envelope_token_error, load_accounts, variant_of,
 };
 use crate::modules::config::{
-    add_checkin_log, http_request, is_route_missing, load_checkin_config, load_checkin_logs,
-    now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
+    add_checkin_log, default_checkin_config, http_request, is_route_missing, load_checkin_config,
+    load_checkin_logs, now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
@@ -212,8 +213,23 @@ pub async fn get_checkin_status(account: &Value) -> Value {
             return status;
         }
         let resp2 = checkin_request("/checkin-status", account).await;
-        if let Some(status) = status_from_response(&resp2) {
-            return status;
+        // 旧活动接口 active=false 时返回全零数据，与真实进行中的活动（如 Buddy加油站）
+        // 无关；采信它会误判「未签到」，提交后旧接口的假成功会导致真实活动漏签。
+        let fallback_inactive = resp2
+            .get("data")
+            .and_then(|d| d.get("active"))
+            .and_then(Value::as_bool)
+            == Some(false);
+        if !fallback_inactive {
+            if let Some(status) = status_from_response(&resp2) {
+                return status;
+            }
+        }
+        if fallback_inactive {
+            return json!({
+                "ok": false,
+                "error": "签到状态不可用（旧活动接口未激活）",
+            });
         }
         let code2 = resp2.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         return json!({
@@ -1400,6 +1416,30 @@ mod tests {
             .map(|day| target_minute(day, "acc-a", start, end))
             .collect();
         assert!(days.len() > 1, "不同日期必须重新抽签: {days:?}");
+    }
+
+    /// 默认窗口 `00:10`–`00:11`：单分钟窗口让每个账号的目标分钟恒为 10，
+    /// 即每日 00:10 触发（不随账号/日期漂移）。
+    #[test]
+    fn default_window_triggers_every_account_at_00_10() {
+        let win = window_minutes(&default_checkin_config()).expect("默认窗口必须生效");
+        assert_eq!(win, (10, 11));
+        for account in [
+            json!({"id": "a"}),
+            json!({"id": "b"}),
+            json!({"id": "c", "email": "c@example.com"}),
+        ] {
+            assert_eq!(
+                target_minute("2026-10-18", &account_key(&account), win.0, win.1),
+                10
+            );
+            let target = target_ms_for_day("2026-10-18", &account, win).unwrap();
+            let local = Local
+                .timestamp_millis_opt(target)
+                .single()
+                .expect("目标时刻必须唯一");
+            assert_eq!((local.hour(), local.minute()), (0, 10));
+        }
     }
 
     #[test]

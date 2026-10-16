@@ -56,6 +56,10 @@ fn spawn_background_loops(app: tauri::AppHandle) {
                 last_keepalive_day = today;
                 let _ = modules::refresh::run_keepalive_cycle().await;
             }
+            // 定时自动刷新：默认 12h 间隔，开关与间隔由设置页配置。
+            let _ = modules::refresh::run_auto_refresh_if_due().await;
+            // 模型目录自动更新：默认 24h 间隔，开关与间隔由模型管理页配置。
+            let _ = modules::model_catalog::auto_update_if_due().await;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
@@ -137,11 +141,9 @@ pub fn run() {
             commands::switch_codebuddy_cn_ide_account,
             commands::detect_codebuddy_cn_ide_account,
             commands::list_codebuddy_ide_sessions,
-            commands::codebuddy_ide_session_links_preview,
             commands::get_codebuddy_ide_status,
             commands::switch_codebuddy_ide_account,
             commands::list_codebuddy_intl_ide_sessions,
-            commands::codebuddy_intl_ide_session_links_preview,
             commands::detect_codebuddy_ide_account,
             commands::delete_account,
             commands::update_account_display,
@@ -154,12 +156,6 @@ pub fn run() {
             commands::import_accounts,
             commands::switch_account,
             commands::list_sessions,
-            commands::list_account_sessions,
-            commands::copy_sessions,
-            commands::copy_sessions_cross,
-            commands::session_links_preview,
-            commands::session_links_preview_cross,
-            commands::session_sync_cross,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,
@@ -182,6 +178,15 @@ pub fn run() {
             commands::get_auto_travel_config,
             commands::save_auto_travel_config,
             commands::refresh_account_token,
+            commands::refresh_all_accounts,
+            commands::get_auto_refresh_config,
+            commands::save_auto_refresh_config,
+            commands::list_proxy_sites,
+            commands::save_proxy_sites,
+            commands::get_model_catalog,
+            commands::refresh_model_catalog,
+            commands::refresh_model_catalog_client_cache,
+            commands::save_model_catalog_config,
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
@@ -210,6 +215,8 @@ pub fn run() {
             commands::reset_proxy_sub_key_usage,
             commands::get_proxy_logs,
             commands::clear_proxy_logs,
+            commands::export_all_data,
+            commands::import_all_data,
             commands::get_proxy_daily_stats,
             commands::get_proxy_sub_key_model_stats,
         ])

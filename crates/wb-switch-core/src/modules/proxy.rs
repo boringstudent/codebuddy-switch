@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -196,12 +196,33 @@ fn db() -> &'static Mutex<ProxyDb> {
     })
 }
 
+/// lock_db 内「账本折叠 + 重载 + 统计回写」的最小间隔：高频请求路径每次调用都做
+/// 同步文件 IO（账本 metadata + 全量 JSON 解析 + daily_stats 重建），一次请求 5-7 次
+/// 调用会把所有并发串行在全局锁上。节流后 250ms 内复用上次收敛结果；
+/// 写路径 save() 仍与磁盘收敛，不会丢外部变更。
+const DB_SYNC_THROTTLE: Duration = Duration::from_millis(250);
+
 fn lock_db() -> MutexGuard<'static, ProxyDb> {
+    static LAST_SYNC: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let sync_lock = LAST_SYNC.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(1)));
+    // 节流判断不跨 db 锁持有，避免锁顺序问题。
+    let due = {
+        let mut last = sync_lock.lock().unwrap();
+        let now = Instant::now();
+        if now.duration_since(*last) >= DB_SYNC_THROTTLE {
+            *last = now;
+            true
+        } else {
+            false
+        }
+    };
     // 先增量折叠账本，再把权威统计回写展示缓存（被其它进程冲掉的累计在这里自愈）。
-    fold_usage_events();
+    if due {
+        fold_usage_events();
+    }
     let mut guard = db().lock().unwrap();
-    guard.reload_if_changed();
-    {
+    if due {
+        guard.reload_if_changed();
         let fold = usage_fold().lock().unwrap();
         sync_usage_into_db(&mut guard.data, &fold);
     }
@@ -248,9 +269,14 @@ impl ProxyDb {
         if let Some(parent) = proxy_db_file().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(text) = std::fs::read_to_string(proxy_db_file()) {
-            if let Ok(disk) = serde_json::from_str::<Value>(&text) {
-                self.data = converge_on_save(&self.data, &disk);
+        // 仅当磁盘文件被外部改过时（mtime 变化）才整文件读盘合并；
+        // 此前每次写都全量读+parse+日志并集排序，一次请求多次 save 时开销成倍。
+        let mtime = db_mtime();
+        if mtime.is_some() && mtime != self.loaded_mtime {
+            if let Ok(text) = std::fs::read_to_string(proxy_db_file()) {
+                if let Ok(disk) = serde_json::from_str::<Value>(&text) {
+                    self.data = converge_on_save(&self.data, &disk);
+                }
             }
         }
         let content = serde_json::to_string_pretty(&self.data).unwrap_or_default();
@@ -967,6 +993,8 @@ fn record_request_end(
         "duration_ms": duration_ms,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
+        // 缓存命中 tokens：用于 /v1/models/pricing 分析费用与缓存命中率的关系。
+        "cached_tokens": cached,
         "credit": (credit * 10000.0).round() / 10000.0,
         "first_token_ms": first_token_ms,
     });
@@ -1010,12 +1038,20 @@ fn usage_numbers(usage: &Value) -> (u64, u64, u64, u64, f64) {
     let total = json_u64(usage.get("total_tokens"))
         .filter(|total| *total > 0)
         .unwrap_or(prompt + completion);
-    // 兼容 OpenAI 风格的嵌套字段（kimi 系上游把缓存命中放在 prompt_tokens_details 里，
-    // 只读顶层会恒为 0，界面「缓存命中」因此不显示）。
-    let cached = json_u64(usage.get("cached_tokens"))
-        .or_else(|| json_u64(usage.get("prompt_cache_hit_tokens")))
-        .or_else(|| json_u64(usage.pointer("/prompt_tokens_details/cached_tokens")))
-        .unwrap_or(0);
+    // 兼容 OpenAI 风格的嵌套字段（kimi 系上游把缓存命中放在 prompt_tokens_details /
+    // prompt_cache_hit_tokens 里）。注意顶层 cached_tokens 恒为 0 也必须跳过：
+    // 2026-10-16 实测 kimi-k3 命中缓存时顶层仍返回 0，只更新嵌套字段，
+    // 不跳过 0 会被短路成恒 0，界面「缓存命中」因此不显示。
+    let cached = [
+        usage.get("cached_tokens"),
+        usage.get("prompt_cache_hit_tokens"),
+        usage.pointer("/prompt_tokens_details/cached_tokens"),
+        usage.get("cache_read_input_tokens"),
+    ]
+    .into_iter()
+    .filter_map(json_u64)
+    .find(|v| *v > 0)
+    .unwrap_or(0);
     let credit = json_f64(usage.get("credit")).unwrap_or(0.0);
     (prompt, completion, total, cached, credit)
 }
@@ -2073,10 +2109,34 @@ fn upstream_url() -> String {
         .trim()
         .to_string();
     if custom.is_empty() {
-        DEFAULT_UPSTREAM.to_string()
-    } else {
-        custom.trim_end_matches('/').to_string()
+        return DEFAULT_UPSTREAM.to_string();
     }
+    // 安全：自定义上游会收到真实上游凭据（Authorization: Bearer access_token），
+    // 强制 https 并拒绝内网/本机地址，防凭据明文外泄与被借道探测内网（SSRF）。
+    let lower = custom.to_lowercase();
+    let host = lower
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', ':']).next())
+        .unwrap_or("");
+    let host_ok = !host.is_empty()
+        && host != "localhost"
+        && !host.starts_with("127.")
+        && !host.starts_with("10.")
+        && !host.starts_with("192.168.")
+        && !host.starts_with("169.254.")
+        && !(host.starts_with("172.")
+            && host
+                .split('.')
+                .nth(1)
+                .and_then(|s| s.parse::<u8>().ok())
+                .is_some_and(|b| (16..=31).contains(&b)))
+        && host != "::1"
+        && host != "[::1]";
+    if !host_ok {
+        eprintln!("[proxy] 忽略非法自定义上游地址（需 https 公网地址）: {custom}");
+        return DEFAULT_UPSTREAM.to_string();
+    }
+    custom.trim_end_matches('/').to_string()
 }
 
 /// 会话标识：system + 第一条 user 消息的 SHA-256 前 16 位（会话亲和模式用）。
@@ -2375,11 +2435,12 @@ fn authenticate(state: &ProxyState, headers: &HeaderMap) -> Option<Value> {
         return None;
     }
     // 本地模式透传：WorkBuddy 客户端会带自己的 JWT，不配置子 Key 也能转发。
-    let tail = &token[token.len().saturating_sub(6)..];
+    // label 只放 token 哈希指纹（曾直接落盘 token 末 6 位到持久化日志，违反最小化原则）。
+    let fingerprint = &format!("{:x}", Sha256::digest(token.as_bytes()))[..8];
     Some(json!({
         "key_id": "_passthrough_",
         "api_key": token,
-        "label": format!("透传(...{tail})"),
+        "label": format!("透传(#{fingerprint})"),
         "is_active": true,
         "allowed_models": [],
         "allowed_key_ids": [],
@@ -2493,22 +2554,55 @@ pub fn proxy_router(mode: &str) -> Router {
             "/v1/key/info",
             get(key_info_handler).options(options_handler),
         )
+        .route("/v1/key/logs", get(key_logs_handler))
+        .route("/v1/models/pricing", get(models_pricing_handler))
+        .route("/v1/sites", get(sites_handler))
+        .route("/query", get(query_page_handler))
         .route(
             "/v1/chat/completions",
             post(chat_completions_handler).options(options_handler),
         )
         .fallback(any(not_found_handler))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(cors_layer))
         .with_state(state)
+}
+
+/// CORS 中间件：只向本机来源（localhost / 127.0.0.1 / Tauri webview）反射 Origin，
+/// 不再用通配 `*`——本地模式对任意 Bearer 透传放行，通配 CORS 会让任意网页
+/// 直接盗用本地代理额度（含 DNS rebinding 场景）。非浏览器客户端不带 Origin，不受影响。
+async fn cors_layer(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut resp = next.run(req).await;
+    if let Some(origin) = origin {
+        if is_allowed_origin(&origin) {
+            if let Ok(value) = origin.parse() {
+                let headers = resp.headers_mut();
+                headers.insert("Access-Control-Allow-Origin", value);
+                headers.insert("Vary", "Origin".parse().unwrap());
+            }
+        }
+    }
+    resp
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    origin == "tauri://localhost"
+        || origin == "http://tauri.localhost"
+        || origin.starts_with("http://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("https://localhost")
+        || origin.starts_with("https://127.0.0.1")
 }
 
 fn json_response(status: StatusCode, data: Value) -> Response {
     (
         status,
-        [
-            ("Content-Type", "application/json; charset=utf-8"),
-            ("Access-Control-Allow-Origin", "*"),
-        ],
+        [("Content-Type", "application/json; charset=utf-8")],
         serde_json::to_string(&data).unwrap_or_default(),
     )
         .into_response()
@@ -2519,7 +2613,7 @@ async fn index_handler() -> Response {
         StatusCode::OK,
         json!({
             "object": "api.index",
-            "message": "wb-switch API proxy is running",
+            "message": "wb-switch API proxy is running - /query 余额查询",
             "version": env!("CARGO_PKG_VERSION"),
         }),
     )
@@ -2544,16 +2638,17 @@ async fn models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> 
                 .collect()
         })
         .unwrap_or_default();
-    let list: Vec<&str> = SUPPORTED_MODELS
-        .iter()
-        .copied()
+    // 模型目录优先（模型管理页拉取的动态列表），空目录回退硬编码常量。
+    let list: Vec<String> = crate::modules::model_catalog::effective_model_ids()
+        .into_iter()
         .filter(|m| allowed.is_empty() || allowed.iter().any(|a| a == m))
         .collect();
     let data: Vec<Value> = list
         .iter()
         .map(|m| {
-            let ctx = model_context_length(m);
-            json!({
+            let ctx = crate::modules::model_catalog::catalog_context_length(m)
+                .unwrap_or_else(|| model_context_length(m));
+            let mut entry = json!({
                 "id": m,
                 "object": "model",
                 "created": now_secs() as u64,
@@ -2565,7 +2660,25 @@ async fn models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> 
                 "maxContextTokens": ctx,
                 "context_window": ctx,
                 "max_context_window": ctx,
-            })
+            });
+            // 目录里有扩展参数时一并下发（思考强度档位 / Max 模式档位 / 积分倍率），
+            // OpenAI 兼容客户端会忽略未知字段，无副作用。
+            if let Some(cat) = crate::modules::model_catalog::catalog_model(m) {
+                for key in [
+                    "thinking_levels",
+                    "default_effort",
+                    "max_mode",
+                    "context_lengths",
+                    "credits_multiplier",
+                    "only_reasoning",
+                    "max_output_tokens",
+                ] {
+                    if let Some(v) = cat.get(key) {
+                        entry[key] = v.clone();
+                    }
+                }
+            }
+            entry
         })
         .collect();
     json_response(StatusCode::OK, json!({"object": "list", "data": data}))
@@ -2613,9 +2726,9 @@ async fn key_info_handler(State(state): State<ProxyState>, headers: HeaderMap) -
         })
         .unwrap_or_default();
     // 空 = 不限制，返回全量支持列表，客户端无需关心空数组语义。
-    let models: Vec<&str> = SUPPORTED_MODELS
-        .iter()
-        .copied()
+    // 模型目录优先：子 Key 看到的模型列表与模型管理页目录保持一致。
+    let models: Vec<String> = crate::modules::model_catalog::effective_model_ids()
+        .into_iter()
         .filter(|m| allowed.is_empty() || allowed.iter().any(|a| a == m))
         .collect();
     json_response(
@@ -2644,6 +2757,570 @@ async fn key_info_handler(State(state): State<ProxyState>, headers: HeaderMap) -
     )
 }
 
+/// GET /v1/key/logs —— 子 Key 自查使用日志（Bearer 同 /v1/key/info）。
+///
+/// 只返回该 Key 自己的日志，且**剥离上游信息**（main_key_id / main_key_label）
+/// 与子 key 标识；问答内容存在时原样返回（本就是该 Key 用户自己发的请求）。
+async fn key_logs_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    let Some(sub_key) = authenticate(&state, &headers) else {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}),
+        );
+    };
+    let key_id = sub_key.get("key_id").and_then(Value::as_str).unwrap_or("");
+    if key_id.is_empty() || key_id == "_passthrough_" {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": {"message": "Endpoint not found", "type": "not_found"}}),
+        );
+    }
+    let logs = request_logs(0.0, 1000);
+    let filtered: Vec<Value> = logs
+        .into_iter()
+        .filter(|l| l.get("sub_key_id").and_then(Value::as_str) == Some(key_id))
+        .take(100)
+        .map(|mut l| {
+            if let Some(obj) = l.as_object_mut() {
+                obj.remove("main_key_id");
+                obj.remove("main_key_label");
+                obj.remove("sub_key_id");
+                obj.remove("sub_key_label");
+            }
+            l
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({"object": "key.logs", "logs": filtered}),
+    )
+}
+
+/// GET /v1/models/pricing —— 子 Key 可见的模型价格与能力参数。
+///
+/// 每个模型返回：目录能力参数（上下文 / 思考强度 / Max 模式档位 / 积分倍率）
+/// + 该 Key 自己日志实测聚合的单价（每 1M tokens 积分）与缓存命中率。
+/// 费用与缓存命中率正相关：cached_tokens 占比越高，实测每 1M tokens 积分越低，
+/// 因此同时给出缓存命中率，便于用户解读单价波动。
+async fn models_pricing_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    let Some(sub_key) = authenticate(&state, &headers) else {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": {"message": "Invalid API key", "type": "authentication_error"}}),
+        );
+    };
+    let key_id = sub_key.get("key_id").and_then(Value::as_str).unwrap_or("");
+    if key_id.is_empty() || key_id == "_passthrough_" {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": {"message": "Endpoint not found", "type": "not_found"}}),
+        );
+    }
+    let allowed: Vec<String> = sub_key
+        .get("allowed_models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let list: Vec<String> = crate::modules::model_catalog::effective_model_ids()
+        .into_iter()
+        .filter(|m| allowed.is_empty() || allowed.iter().any(|a| a == m))
+        .collect();
+
+    // 按模型聚合该 Key 的实测用量（仅本 Key，不触碰任何上游信息）。
+    let mut agg: std::collections::HashMap<String, (u64, u64, u64, f64, u64)> =
+        std::collections::HashMap::new(); // model -> (requests, tokens, cached, credits, prompt)
+    for log in request_logs(0.0, 2000) {
+        if log.get("sub_key_id").and_then(Value::as_str) != Some(key_id) {
+            continue;
+        }
+        if log.get("event").and_then(Value::as_str) != Some("end") {
+            continue;
+        }
+        let model = log
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if model.is_empty() {
+            continue;
+        }
+        let prompt = log
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let completion = log
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached = log
+            .get("cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let credit = log.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        let e = agg.entry(model).or_default();
+        e.0 += 1;
+        e.1 += prompt + completion;
+        e.2 += cached;
+        e.3 += credit;
+        e.4 += prompt;
+    }
+
+    let models: Vec<Value> = list
+        .iter()
+        .map(|m| {
+            let mut entry = json!({"id": m});
+            if let Some(cat) = crate::modules::model_catalog::catalog_model(m) {
+                for key in [
+                    "name",
+                    "context_length",
+                    "context_lengths",
+                    "context_default",
+                    "thinking_levels",
+                    "default_effort",
+                    "only_reasoning",
+                    "can_disable_thinking",
+                    "max_mode",
+                    "max_output_tokens",
+                    "max_allowed_size",
+                    "credits_multiplier",
+                    "temperature",
+                    "top_p",
+                    "tags",
+                    "related_models",
+                ] {
+                    if let Some(v) = cat.get(key) {
+                        entry[key] = v.clone();
+                    }
+                }
+            }
+            if entry.get("context_length").is_none() {
+                entry["context_length"] = json!(model_context_length(m));
+            }
+            // 实测单价：credits / tokens * 1e6（该 Key 自己的真实消耗）。
+            if let Some((requests, tokens, cached, credits, prompt)) = agg.get(m) {
+                if *tokens > 0 {
+                    entry["measured"] = json!({
+                        "requests": requests,
+                        "total_tokens": tokens,
+                        "cached_tokens": cached,
+                        "credits": (credits * 10000.0).round() / 10000.0,
+                        // 每 1M tokens 消耗积分（实测均值，受缓存命中率影响）。
+                        "credits_per_1m": ((credits / *tokens as f64 * 1_000_000.0) * 100.0).round() / 100.0,
+                        "credits_yuan_per_1m": ((credits / *tokens as f64 * 1_000_000.0 / 400.0) * 100.0).round() / 100.0,
+                        // 缓存命中率 = 命中 tokens / 输入 tokens。
+                        "cache_hit_rate": if *prompt > 0 {
+                            ((*cached as f64 / *prompt as f64) * 1000.0).round() / 1000.0
+                        } else {
+                            0.0
+                        },
+                    });
+                }
+            }
+            entry
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "object": "models.pricing",
+            "models": models,
+            "credits_per_yuan": 400,
+            "pricing_note": "实测单价按该 Key 的真实消耗统计：credits_per_1m = 总积分 / 总 tokens × 100 万；缓存命中率越高，单位价格越低（命中缓存的输入按缓存价计费）",
+            "upstream_params": crate::modules::model_catalog::upstream_params_doc(),
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 站点存活检测（FRP 多节点）
+// ---------------------------------------------------------------------------
+
+/// 站点列表持久化在 proxy_db settings.sites：`[{name, url}]`。
+pub fn list_sites() -> Vec<Value> {
+    get_settings()
+        .get("sites")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.is_object())
+        .collect()
+}
+
+/// 保存站点列表（管理员在桌面端调整）；逐项校验名称与 http(s) URL。
+pub fn save_sites(sites: &Value) -> Result<Value, String> {
+    let arr = sites.as_array().ok_or("sites 必须是数组")?;
+    let mut cleaned: Vec<Value> = Vec::new();
+    for item in arr {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let url = item
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if name.is_empty() || url.is_empty() {
+            continue;
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(format!("站点「{name}」的 URL 必须以 http(s):// 开头"));
+        }
+        cleaned.push(json!({"name": name, "url": url}));
+    }
+    save_settings(&json!({"sites": cleaned}));
+    // 配置变了就作废存活缓存，下次查询立刻按新列表探测。
+    *site_status_cache().lock().unwrap() = None;
+    Ok(json!({"sites": cleaned}))
+}
+
+/// 站点探测结果缓存：60 秒内重复查询直接复用，避免每个访客都触发一轮外网探测。
+fn site_status_cache() -> &'static std::sync::Mutex<Option<(Vec<Value>, std::time::Instant)>> {
+    static CACHE: OnceLock<std::sync::Mutex<Option<(Vec<Value>, std::time::Instant)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+async fn probe_site(name: &str, url: &str) -> Value {
+    let probe_url = format!("{url}/v1/models");
+    let started = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build();
+    let (ok, detail) = match client {
+        Ok(client) => match client.get(&probe_url).send().await {
+            // 拿到任何 HTTP 响应都算存活（401/403 说明服务在线，只是没鉴权）。
+            Ok(resp) => (true, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => (false, "连接失败".to_string()),
+        },
+        Err(e) => (false, e.to_string()),
+    };
+    json!({
+        "name": name,
+        "url": url,
+        "ok": ok,
+        "latency_ms": started.elapsed().as_millis() as u64,
+        "detail": detail,
+    })
+}
+
+/// GET /v1/sites —— 公开：站点列表 + 实时存活状态（60 秒缓存）。
+async fn sites_handler() -> Response {
+    {
+        let cache = site_status_cache().lock().unwrap();
+        if let Some((results, at)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(60) {
+                return json_response(
+                    StatusCode::OK,
+                    json!({"object": "sites", "sites": results, "cached": true}),
+                );
+            }
+        }
+    }
+    let sites = list_sites();
+    let mut results = Vec::with_capacity(sites.len());
+    for site in &sites {
+        let name = site.get("name").and_then(Value::as_str).unwrap_or("");
+        let url = site.get("url").and_then(Value::as_str).unwrap_or("");
+        results.push(probe_site(name, url).await);
+    }
+    let checked_at = now_secs();
+    *site_status_cache().lock().unwrap() = Some((results.clone(), std::time::Instant::now()));
+    json_response(
+        StatusCode::OK,
+        json!({"object": "sites", "sites": results, "checked_at": checked_at}),
+    )
+}
+
+/// GET /query —— 子 Key 用户自助查询页（余额 / 日志 / 站点存活）。
+///
+/// 单文件 HTML：Key 持久保存在浏览器 localStorage，不经过服务端；
+/// 页面只调本代理的公开端点，不暴露任何上游信息。
+async fn query_page_handler() -> Response {
+    axum::response::Html(QUERY_PAGE_HTML).into_response()
+}
+
+const QUERY_PAGE_HTML: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Key 余额查询</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=password], input[type=text] { flex: 1; min-width: 200px; background: #0f172a; border: 1px solid #475569;
+         color: #e2e8f0; border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+  button { background: #3b82f6; border: 0; color: #fff; border-radius: 8px; padding: 10px 18px;
+           font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .ghost { background: transparent; border: 1px solid #475569; color: #94a3b8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .stat { background: #0f172a; border-radius: 8px; padding: 12px; }
+  .stat .k { font-size: 12px; color: #94a3b8; }
+  .stat .v { font-size: 18px; font-weight: 600; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; font-weight: 500; }
+  .err { color: #f87171; font-size: 13px; margin-top: 8px; }
+  .site { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #0f172a;
+          border-radius: 8px; margin-bottom: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+  .dot.off { background: #ef4444; }
+  .site .u { color: #94a3b8; font-size: 12px; word-break: break-all; }
+  .muted { color: #64748b; font-size: 12px; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  /* 可折叠卡片：标题行整行可点，箭头指示状态，展开状态记在 localStorage。 */
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+               cursor: pointer; user-select: none; }
+  .card-head h2 { margin: 0; }
+  .caret { flex: none; color: #94a3b8; font-size: 12px; transition: transform .15s; }
+  .card.collapsed .caret { transform: rotate(-90deg); }
+  .card.collapsed .body { display: none; }
+  .card .body { margin-top: 12px; }
+  .card-head + .body { margin-top: 12px; }
+  .notice { background: #1e293b; border: 1px solid #3b82f6; border-radius: 12px; padding: 12px 14px;
+            margin-bottom: 16px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
+  .notice b { color: #93c5fd; font-weight: 600; }
+  .qq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #fbbf24; }
+  footer { color: #475569; font-size: 12px; text-align: center; margin-top: 24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Key 余额查询</h1>
+  <div class="sub">输入你的 API Key 查询额度、用量与调用日志。Key 只保存在你自己的浏览器里。</div>
+
+  <div class="notice">
+    <span>💡</span>
+    <div>如果需要<b>独享 Key</b>，请找 <span class="qq">1972403603（QQ）</span>。</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="key" type="password" placeholder="sk-..." autocomplete="off">
+      <button id="go">查询</button>
+      <button id="clear" class="ghost">清除已存 Key</button>
+    </div>
+    <div id="err" class="err"></div>
+  </div>
+
+  <div id="result" style="display:none">
+    <div class="card" id="card-usage" data-card="usage">
+      <div class="card-head"><h2>额度与用量 <span id="label" class="muted"></span></h2><span class="caret">▾</span></div>
+      <div class="body">
+        <div class="grid" id="stats"></div>
+      </div>
+    </div>
+    <div class="card collapsed" id="card-models" data-card="models">
+      <div class="card-head"><h2>模型参数与实测价格</h2><span class="caret">▾</span></div>
+      <div class="body">
+        <div style="overflow:auto; max-height:320px"><table>
+          <thead><tr>
+            <th>模型</th><th>上下文</th><th>思考强度</th><th>Max 模式</th><th>积分倍率</th>
+            <th>实测单价 /1M tokens</th><th>缓存命中率</th>
+          </tr></thead>
+          <tbody id="models"></tbody>
+        </table></div>
+        <div class="muted" id="pricing-note" style="margin-top:8px"></div>
+        <div class="muted" id="upstream-params" style="margin-top:4px"></div>
+      </div>
+    </div>
+    <div class="card collapsed" id="card-logs" data-card="logs">
+      <div class="card-head"><h2>调用日志（最近 100 条）</h2><span class="caret">▾</span></div>
+      <div class="body">
+        <div style="overflow:auto; max-height:320px"><table>
+          <thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>积分</th><th>耗时</th><th>状态</th></tr></thead>
+          <tbody id="logs"></tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card collapsed" id="card-sites" data-card="sites">
+    <div class="card-head"><h2>服务站点状态</h2><span class="caret">▾</span></div>
+    <div class="body"><div id="sites"><div class="muted">加载中…</div></div></div>
+  </div>
+
+  <footer>如果需要独享 Key，请找 <span class="qq">1972403603（QQ）</span>。</footer>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const LS_KEY = "wb_query_key";
+$("key").value = localStorage.getItem(LS_KEY) || "";
+
+// 卡片折叠：默认展开额度，其余收起；展开状态按卡片 id 记住，刷新后保持。
+const DEFAULT_OPEN = { usage: true, models: false, logs: false, sites: false };
+function initCollapsible() {
+  document.querySelectorAll(".card[data-card]").forEach((card) => {
+    const name = card.dataset.card;
+    const saved = localStorage.getItem("wb_query_open_" + name);
+    const open = saved === null ? !!DEFAULT_OPEN[name] : saved === "1";
+    card.classList.toggle("collapsed", !open);
+    card.querySelector(".card-head").addEventListener("click", () => {
+      const nowOpen = card.classList.toggle("collapsed") === false;
+      localStorage.setItem("wb_query_open_" + name, nowOpen ? "1" : "0");
+    });
+  });
+}
+initCollapsible();
+
+function fmtNum(n) { return n === 0 ? "不限" : String(n); }
+function fmtTs(ts) {
+  const ms = ts > 1e12 ? ts : ts * 1000;
+  return new Date(ms).toLocaleString();
+}
+function stat(k, v) {
+  return `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+}
+
+async function query() {
+  const key = $("key").value.trim();
+  $("err").textContent = "";
+  if (!key) { $("err").textContent = "请输入 Key"; return; }
+  localStorage.setItem(LS_KEY, key);
+  $("go").disabled = true;
+  try {
+    const h = { "Authorization": "Bearer " + key };
+    const [infoResp, logsResp, pricingResp] = await Promise.all([
+      fetch("/v1/key/info", { headers: h }),
+      fetch("/v1/key/logs", { headers: h }),
+      fetch("/v1/models/pricing", { headers: h }),
+    ]);
+    if (!infoResp.ok) {
+      const j = await infoResp.json().catch(() => ({}));
+      throw new Error(j.error && j.error.message ? j.error.message : ("查询失败 HTTP " + infoResp.status));
+    }
+    const info = await infoResp.json();
+    const logs = logsResp.ok ? (await logsResp.json()).logs || [] : [];
+    const pricing = pricingResp.ok ? await pricingResp.json() : null;
+    renderInfo(info);
+    renderLogs(logs);
+    renderPricing(pricing);
+    $("result").style.display = "";
+  } catch (e) {
+    $("err").textContent = e.message || String(e);
+    $("result").style.display = "none";
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+function renderInfo(info) {
+  const L = info.limits || {}, U = info.usage || {};
+  $("label").textContent = info.label ? "（" + info.label + "）" : "";
+  const remainCredits = L.max_credits > 0 ? (L.max_credits - (U.total_credits || 0)) : null;
+  const remainTokens = L.max_tokens > 0 ? (L.max_tokens - (U.total_tokens || 0)) : "不限";
+  const remainCount = L.max_usage > 0 ? (L.max_usage - (U.used_count || 0)) : "不限";
+  const usedCredits = U.total_credits || 0;
+  $("stats").innerHTML = [
+    stat("剩余积分", remainCredits === null ? "不限" : remainCredits.toFixed(4)),
+    stat("剩余折合人民币", remainCredits === null ? "不限" : "¥" + (remainCredits / 400).toFixed(2)),
+    stat("剩余 Tokens", remainTokens),
+    stat("剩余次数", remainCount),
+    stat("已用积分", usedCredits.toFixed(4)),
+    stat("已用折合人民币", "¥" + (usedCredits / 400).toFixed(2)),
+    stat("调用次数", U.used_count || 0),
+    stat("限流", fmtNum(L.rate_limit_rpm) + (L.rate_limit_rpm ? " 次/分" : "")),
+    stat("可用模型", info.allowed_all_models ? "全部" : (info.allowed_models || []).length + " 个"),
+  ].join("") +
+  '<div class="muted" style="margin-top:8px">折算口径：400 积分 = 1 元（官方充值价）</div>';
+}
+
+function renderLogs(logs) {
+  if (!logs.length) {
+    $("logs").innerHTML = '<tr><td colspan="6" class="muted">暂无日志</td></tr>';
+    return;
+  }
+  $("logs").innerHTML = logs.map((l) => {
+    const tokens = (l.prompt_tokens || 0) + (l.completion_tokens || 0);
+    const status = l.event === "end" ? "成功" : (l.error ? "失败" : (l.event || "—"));
+    return `<tr><td>${fmtTs(l.timestamp)}</td><td>${l.model || "—"}</td>` +
+      `<td>${tokens}</td><td>${l.credit ?? "—"}</td>` +
+      `<td>${l.duration_ms ? (l.duration_ms / 1000).toFixed(1) + "s" : "—"}</td><td>${status}</td></tr>`;
+  }).join("");
+}
+
+function fmtCtx(n) {
+  if (!n) return "—";
+  if (n >= 1048576) return (n / 1048576).toFixed(n % 1048576 ? 1 : 0) + "M";
+  if (n >= 1024) return (n / 1024).toFixed(n % 1024 ? 1 : 0) + "K";
+  return String(n);
+}
+
+function renderPricing(pricing) {
+  const models = pricing && pricing.models || [];
+  if (!models.length) {
+    $("models").innerHTML = '<tr><td colspan="7" class="muted">暂无模型数据</td></tr>';
+    $("pricing-note").textContent = "";
+    $("upstream-params").textContent = "";
+    return;
+  }
+  $("models").innerHTML = models.map((m) => {
+    const efforts = (m.thinking_levels || []).length
+      ? m.thinking_levels.join(" / ") + (m.default_effort ? "（默认 " + m.default_effort + "）" : "")
+      : (m.only_reasoning ? "仅思考模式" : "—");
+    const maxMode = m.max_mode ? fmtCtx(m.max_mode) : "—";
+    const mult = m.credits_multiplier != null ? "x" + m.credits_multiplier : "—";
+    let price = "暂无用量";
+    let cache = "—";
+    if (m.measured) {
+      price = m.measured.credits_per_1m + " 积分（≈¥" + m.measured.credits_yuan_per_1m + "）";
+      cache = (m.measured.cache_hit_rate * 100).toFixed(1) + "%";
+    }
+    return `<tr><td>${m.name || m.id}<div class="muted">${m.id}</div></td>` +
+      `<td>${fmtCtx(m.context_length)}</td><td>${efforts}</td><td>${maxMode}</td>` +
+      `<td>${mult}</td><td>${price}</td><td>${cache}</td></tr>`;
+  }).join("");
+  $("pricing-note").textContent = pricing.pricing_note || "";
+  const up = pricing.upstream_params || {};
+  const parts = Object.keys(up).map((k) => k + "：" + up[k]);
+  $("upstream-params").textContent = parts.length ? "上游参数——" + parts.join("；") : "";
+}
+
+async function loadSites() {
+  try {
+    const resp = await fetch("/v1/sites");
+    const j = await resp.json();
+    const sites = j.sites || [];
+    if (!sites.length) { $("sites").innerHTML = '<div class="muted">暂无站点</div>'; return; }
+    $("sites").innerHTML = sites.map((s) =>
+      `<div class="site"><span class="dot ${s.ok ? "on" : "off"}"></span>` +
+      `<div><div>${s.name} <span class="muted">${s.latency_ms}ms · ${s.detail || ""}</span></div>` +
+      `<div class="u">${s.url}</div></div></div>`
+    ).join("");
+  } catch (e) {
+    $("sites").innerHTML = '<div class="muted">站点状态加载失败</div>';
+  }
+}
+
+$("go").onclick = query;
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") query(); });
+$("clear").onclick = () => { localStorage.removeItem(LS_KEY); $("key").value = ""; $("result").style.display = "none"; };
+loadSites();
+if ($("key").value) query();
+</script>
+</body>
+</html>
+"##;
+
 async fn not_found_handler() -> Response {
     // 404 而不是 401：避免客户端把未识别端点误判为认证失效触发重登录。
     json_response(
@@ -2653,10 +3330,10 @@ async fn not_found_handler() -> Response {
 }
 
 /// OPTIONS 预检：Electron/WebView 客户端会发 CORS 预检，缺了会被 501 卡死。
+/// ACAO 由 cors_layer 按来源注入（仅本机来源）。
 async fn options_handler() -> Response {
     Response::builder()
         .status(StatusCode::OK)
-        .header("Access-Control-Allow-Origin", "*")
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         .header(
             "Access-Control-Allow-Headers",
@@ -3011,12 +3688,13 @@ async fn chat_completions_handler(
                 ));
                 if same_key_retried.insert(key_id.clone()) {
                     // 超时/连接错误：同 Key 重试一次。
-                    last_error = format!("Proxy error: {error}");
+                    // 网络错误细节（含自定义上游 URL）只进内部日志，返回客户端用通用文案。
+                    last_error = "Upstream unreachable".to_string();
                     last_status = StatusCode::INTERNAL_SERVER_ERROR;
                     continue;
                 }
                 tried.insert(key_id.clone());
-                last_error = format!("Proxy error: {error}");
+                last_error = "Upstream unreachable".to_string();
                 last_status = StatusCode::INTERNAL_SERVER_ERROR;
                 continue;
             }
@@ -3175,19 +3853,28 @@ async fn chat_completions_handler(
             let key_id_task = key_id.clone();
             let key_for_points = upstream_key.clone();
             let question_task = question.clone();
+            // 日志关闭问答内容时旁路不再逐行解析聚合回复（每行一次 JSON parse 的纯浪费）；
+            // 开启时也只留末尾 500 字（tail_only），大回复不常驻内存。
+            let collect_answer = log_content_enabled;
             tokio::spawn(async move {
                 let mut scan = UsageScan::new();
-                // 同步聚合回复文本（日志 answer 用），与转发互不干扰。
-                let mut collector = SseCollector::default();
+                let mut collector = SseCollector {
+                    tail_only: true,
+                    ..Default::default()
+                };
                 scan.feed(&first_text);
-                collector.feed(&first_text);
+                if collect_answer {
+                    collector.feed(&first_text);
+                }
                 let mut client_gone = tx.send(Ok(first_chunk)).await.is_err();
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(bytes) => {
-                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            let text = String::from_utf8_lossy(&bytes);
                             scan.feed(&text);
-                            collector.feed(&text);
+                            if collect_answer {
+                                collector.feed(&text);
+                            }
                             if !client_gone && tx.send(Ok(bytes)).await.is_err() {
                                 client_gone = true;
                             }
@@ -3224,7 +3911,6 @@ async fn chat_completions_handler(
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/event-stream; charset=utf-8")
                 .header("Cache-Control", "no-cache")
-                .header("Access-Control-Allow-Origin", "*")
                 .body(Body::from_stream(body_stream))
                 .unwrap();
         }
@@ -3373,6 +4059,9 @@ struct SseCollector {
     reasoning: String,
     chat_id: String,
     model_name: String,
+    /// 流式转发旁路（只为日志 answer）开启：只保留 content 末尾 500 字、不攒 reasoning，
+    /// 避免大回复数百 KB 常驻内存（日志最终也只截 500 字）。
+    tail_only: bool,
 }
 
 impl SseCollector {
@@ -3405,9 +4094,20 @@ impl SseCollector {
                 if let Some(content) = delta.get("content").and_then(Value::as_str) {
                     self.content.push_str(content);
                 }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    self.reasoning.push_str(reasoning);
+                if !self.tail_only {
+                    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                    {
+                        self.reasoning.push_str(reasoning);
+                    }
                 }
+            }
+        }
+        if self.tail_only {
+            // 超限才裁剪（留一倍余量摊销裁剪成本），按字符边界截断。
+            let cap = LOG_CONTENT_MAX_CHARS * 2;
+            if self.content.chars().count() > cap {
+                let skip = self.content.chars().count() - LOG_CONTENT_MAX_CHARS;
+                self.content = self.content.chars().skip(skip).collect();
             }
         }
         // tail 防御性上限（畸形流永远不换行时不至于撑爆内存）。
@@ -3521,6 +4221,112 @@ pub fn now_iso_string() -> String {
     now_iso()
 }
 
+// ---------------------------------------------------------------------------
+// 一键导出 / 导入全部数据（账号库 + 代理设置 + 上游/子 Key + 请求日志）
+// ---------------------------------------------------------------------------
+
+/// 备份文件标识。
+pub const BACKUP_KIND: &str = "wb-switch-backup";
+
+/// 导出全部数据到指定路径（系统保存对话框产物），返回该路径。
+/// 含完整账号记录（含 token）、代理设置、上游/子 Key 与请求日志。
+pub fn export_all_data_to_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() || !path.to_lowercase().ends_with(".json") {
+        return Err("导出路径必须是 .json 文件".to_string());
+    }
+    let data = {
+        let db = lock_db();
+        json!({
+            "kind": BACKUP_KIND,
+            "version": 1,
+            "exported_at": now_iso(),
+            "accounts": account::load_accounts(),
+            "proxy": {
+                "settings": db.data.get("settings").cloned().unwrap_or(json!({})),
+                "upstream_keys": db.data.get("upstream_keys").cloned().unwrap_or(json!([])),
+                "sub_api_keys": db.data.get("sub_api_keys").cloned().unwrap_or(json!([])),
+                "request_logs": db.data.get("request_logs").cloned().unwrap_or(json!([])),
+            },
+        })
+    };
+    let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    atomic_write(&PathBuf::from(path), &content).map_err(|e| format!("写入导出文件失败：{e}"))?;
+    Ok(path.to_string())
+}
+
+/// 从备份文件导入：账号按 uid 合并（同 uid 覆盖）；代理设置整体合并；
+/// 上游 Key 按 api_key 去重追加、子 Key 按 key_id 去重追加；历史日志不回写。
+pub fn import_all_data_from_path(path: &str) -> Result<Value, String> {
+    let text =
+        std::fs::read_to_string(path.trim()).map_err(|e| format!("读取导入文件失败：{e}"))?;
+    let data: Value =
+        serde_json::from_str(&text).map_err(|e| format!("文件不是合法的 JSON：{e}"))?;
+    if data.get("kind").and_then(Value::as_str) != Some(BACKUP_KIND) {
+        return Err("不是 wb-switch 备份文件（缺少 kind 标识）".to_string());
+    }
+
+    let mut result = json!({});
+
+    // 账号：复用现有合并逻辑（按 uid 去重，缺凭据跳过）。
+    if let Some(accounts) = data.get("accounts").and_then(Value::as_array) {
+        if !accounts.is_empty() {
+            let text = serde_json::to_string(accounts).map_err(|e| e.to_string())?;
+            let indexes: Vec<usize> = (0..accounts.len()).collect();
+            let r = crate::modules::export_import::import_accounts(&text, &indexes)?;
+            result["accounts"] = json!({
+                "imported": r.imported,
+                "skipped": r.skipped,
+                "overwritten": r.overwritten,
+            });
+        }
+    }
+
+    if let Some(proxy) = data.get("proxy") {
+        if let Some(settings) = proxy.get("settings") {
+            if settings.is_object() {
+                save_settings(settings);
+            }
+        }
+        let mut upstream_added = 0usize;
+        if let Some(keys) = proxy.get("upstream_keys").and_then(Value::as_array) {
+            let existing: HashSet<String> = list_upstream_keys()
+                .iter()
+                .filter_map(|k| k.get("api_key").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            for key in keys {
+                let api_key = key.get("api_key").and_then(Value::as_str).unwrap_or("");
+                if api_key.is_empty() || existing.contains(api_key) {
+                    continue;
+                }
+                add_upstream_key(key.clone());
+                upstream_added += 1;
+            }
+        }
+        let mut sub_keys_added = 0usize;
+        if let Some(keys) = proxy.get("sub_api_keys").and_then(Value::as_array) {
+            let existing: HashSet<String> = list_sub_keys()
+                .iter()
+                .filter_map(|k| k.get("key_id").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            for key in keys {
+                let key_id = key.get("key_id").and_then(Value::as_str).unwrap_or("");
+                if key_id.is_empty() || existing.contains(key_id) {
+                    continue;
+                }
+                add_sub_key(key.clone());
+                sub_keys_added += 1;
+            }
+        }
+        result["proxy"] = json!({
+            "upstream_added": upstream_added,
+            "sub_keys_added": sub_keys_added,
+        });
+    }
+
+    Ok(result)
+}
+
 /// 子 Key 可用积分总和（其允许的上游 Key 剩余积分之和）。
 pub fn total_points_for_sub_key(allowed_key_ids: &[String]) -> f64 {
     list_upstream_keys()
@@ -3592,6 +4398,16 @@ mod tests {
         // 顶层字段优先于嵌套字段。
         let usage = json!({"prompt_tokens": 10, "cached_tokens": 3, "prompt_tokens_details": {"cached_tokens": 6}});
         assert_eq!(usage_numbers(&usage).3, 3);
+        // 顶层为 0 不能遮蔽嵌套的非零命中（kimi-k3 实测响应形态）。
+        let usage =
+            json!({"prompt_tokens": 1373, "cached_tokens": 0, "prompt_cache_hit_tokens": 1280});
+        assert_eq!(usage_numbers(&usage).3, 1280);
+        let usage = json!({"prompt_tokens": 1373, "cached_tokens": 0, "prompt_cache_hit_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 1280}});
+        assert_eq!(usage_numbers(&usage).3, 1280);
+        let usage =
+            json!({"prompt_tokens": 1373, "cached_tokens": 0, "cache_read_input_tokens": 512});
+        assert_eq!(usage_numbers(&usage).3, 512);
     }
 
     /// usage 采纳门槛同样容忍字符串数字：否则整个 usage 对象被丢弃，Token / 积分一并漏记。

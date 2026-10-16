@@ -27,6 +27,7 @@ import type {
   ProxyUpstreamKey,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { CREDITS_PER_YUAN, creditsPerKToken, creditsToYuan, fmtYuan, yuanToCredits } from "@/lib/credits";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -343,13 +344,23 @@ function SubKeyDialog({
   // 上游 Key 列表积分排序：true = 高→低，false = 低→高（积分未知恒沉底）。
   const [pointsSortDesc, setPointsSortDesc] = useState(true);
   const [saving, setSaving] = useState(false);
+  // 模型选项与「模型管理」目录联动：目录非空用目录（含新增模型），空则回退内置列表。
+  const [modelOptions, setModelOptions] = useState<string[]>(SUPPORTED_MODELS);
+  useEffect(() => {
+    let cancelled = false;
+    void api.getModelCatalog().then((cat) => {
+      const ids = (cat.models ?? []).map((m) => m.id).filter(Boolean);
+      if (!cancelled && ids.length > 0) setModelOptions(ids);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     setLabel(editKey?.label ?? "");
     // 允许模型默认全选：新建 / 未限制（空 = 全部）时全部勾选，用户自行取消来限制。
     const allowed = editKey?.allowed_models ?? [];
-    setModels(new Set(allowed.length === 0 ? SUPPORTED_MODELS : allowed));
+    setModels(new Set(allowed.length === 0 ? modelOptions : allowed));
     setKeyIds(new Set(editKey?.allowed_key_ids ?? []));
     setMaxUsage(editKey?.max_usage ?? 0);
     setMaxTokensM((editKey?.max_tokens ?? 0) / 1_000_000);
@@ -374,7 +385,7 @@ function SubKeyDialog({
     setSaving(true);
     try {
       // 全选或全不选都等价于「不限制」（后端空数组 = 全部允许）。
-      const allSelected = models.size === SUPPORTED_MODELS.length;
+      const allSelected = models.size === modelOptions.length;
       await onSubmit({
         label: label.trim(),
         allowed_models: allSelected || models.size === 0 ? [] : [...models],
@@ -409,7 +420,7 @@ function SubKeyDialog({
           <div className="grid gap-1.5">
             <Label>允许模型（默认全选，取消勾选即限制）</Label>
             <div className="grid max-h-36 grid-cols-2 gap-x-3 overflow-y-auto rounded-md border p-2 sm:grid-cols-3">
-              {SUPPORTED_MODELS.map((m) => (
+              {modelOptions.map((m) => (
                 <label key={m} className="flex cursor-pointer items-center gap-1.5 py-0.5 text-xs">
                   <Checkbox
                     checked={models.has(m)}
@@ -680,23 +691,173 @@ function ModelStatsDialog({
                   <TableHead>Token</TableHead>
                   <TableHead>Token占比</TableHead>
                   <TableHead>积分消耗</TableHead>
+                  <TableHead>单价（积分/千Token）</TableHead>
+                  <TableHead>折算金额</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {models.map((m) => (
-                  <TableRow key={m.model}>
-                    <TableCell className="font-mono text-xs">
-                      {m.model === "unknown" ? "历史（功能上线前）" : m.model}
-                    </TableCell>
-                    <TableCell>{m.count}</TableCell>
-                    <TableCell>{m.count_pct.toFixed(2)}%</TableCell>
-                    <TableCell title={`输入: ${m.prompt_tokens} 输出: ${m.completion_tokens} 缓存: ${m.cached_tokens}`}>
-                      {fmtTokens(m.total_tokens)}
-                    </TableCell>
-                    <TableCell>{m.token_pct.toFixed(2)}%</TableCell>
-                    <TableCell>{m.credits.toFixed(2)}</TableCell>
-                  </TableRow>
-                ))}
+                {models.map((m) => {
+                  const unitPrice = creditsPerKToken(m.credits, m.total_tokens);
+                  return (
+                    <TableRow key={m.model}>
+                      <TableCell className="font-mono text-xs">
+                        {m.model === "unknown" ? "历史（功能上线前）" : m.model}
+                      </TableCell>
+                      <TableCell>{m.count}</TableCell>
+                      <TableCell>{m.count_pct.toFixed(2)}%</TableCell>
+                      <TableCell title={`输入: ${m.prompt_tokens} 输出: ${m.completion_tokens} 缓存: ${m.cached_tokens}`}>
+                        {fmtTokens(m.total_tokens)}
+                      </TableCell>
+                      <TableCell>{m.token_pct.toFixed(2)}%</TableCell>
+                      <TableCell>{m.credits.toFixed(2)}</TableCell>
+                      <TableCell>{unitPrice === null ? "-" : unitPrice.toFixed(3)}</TableCell>
+                      <TableCell title={`按 ${CREDITS_PER_YUAN * 10} 积分 = 10 元折算`}>
+                        {fmtYuan(creditsToYuan(m.credits))}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 积分换算与模型单价对话框（聚合全部子 Key 的真实消耗数据）
+// ---------------------------------------------------------------------------
+
+function CreditConverterDialog({
+  open,
+  onOpenChange,
+  subKeys,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  subKeys: ProxySubKey[];
+}) {
+  const [rows, setRows] = useState<
+    { model: string; count: number; totalTokens: number; credits: number }[]
+  >([]);
+  const [loading, setLoading] = useState(false);
+  const [creditsInput, setCreditsInput] = useState("4000");
+  const [yuanInput, setYuanInput] = useState("10");
+
+  useEffect(() => {
+    if (!open || subKeys.length === 0) return;
+    setLoading(true);
+    // 聚合所有子 Key 的模型维度统计（真实消耗口径：积分 ÷ Token）。
+    Promise.allSettled(subKeys.map((k) => api.getProxySubKeyModelStats(k.key_id)))
+      .then((results) => {
+        const merged = new Map<string, { count: number; totalTokens: number; credits: number }>();
+        for (const r of results) {
+          if (r.status !== "fulfilled") continue;
+          for (const m of r.value.models ?? []) {
+            if (m.model === "unknown") continue;
+            const acc = merged.get(m.model) ?? { count: 0, totalTokens: 0, credits: 0 };
+            acc.count += m.count;
+            acc.totalTokens += m.total_tokens;
+            acc.credits += m.credits;
+            merged.set(m.model, acc);
+          }
+        }
+        setRows(
+          [...merged.entries()]
+            .map(([model, v]) => ({ model, ...v }))
+            .sort((a, b) => b.credits - a.credits),
+        );
+      })
+      .finally(() => setLoading(false));
+  }, [open, subKeys]);
+
+  const creditsNum = Number(creditsInput);
+  const yuanNum = Number(yuanInput);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>积分换算与模型单价</DialogTitle>
+          <DialogDescription>
+            官方充值口径 {CREDITS_PER_YUAN * 10} 积分 = 10 元（1 元 = {CREDITS_PER_YUAN} 积分）；
+            单价由代理真实消耗数据（积分 ÷ Token）计算。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="rounded-md border p-3">
+            <Label className="text-xs text-muted-foreground">积分 → 人民币</Label>
+            <div className="mt-2 flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                value={creditsInput}
+                onChange={(e) => setCreditsInput(e.target.value)}
+                className="h-8 w-32"
+              />
+              <span className="text-sm text-muted-foreground">积分 =</span>
+              <span className="text-sm font-medium">
+                {Number.isFinite(creditsNum) ? fmtYuan(creditsToYuan(creditsNum)) : "-"}
+              </span>
+            </div>
+          </div>
+          <div className="rounded-md border p-3">
+            <Label className="text-xs text-muted-foreground">人民币 → 积分</Label>
+            <div className="mt-2 flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                value={yuanInput}
+                onChange={(e) => setYuanInput(e.target.value)}
+                className="h-8 w-32"
+              />
+              <span className="text-sm text-muted-foreground">元 =</span>
+              <span className="text-sm font-medium">
+                {Number.isFinite(yuanNum) ? `${yuanToCredits(yuanNum).toLocaleString()} 积分` : "-"}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" /> 汇总模型数据中…
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="py-6 text-sm text-muted-foreground">暂无模型消耗数据</div>
+        ) : (
+          <div className="max-h-72 overflow-y-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>模型</TableHead>
+                  <TableHead>调用次数</TableHead>
+                  <TableHead>积分/千Token</TableHead>
+                  <TableHead>元/千Token</TableHead>
+                  <TableHead>元/百万Token</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((r) => {
+                  const perK = creditsPerKToken(r.credits, r.totalTokens);
+                  return (
+                    <TableRow key={r.model}>
+                      <TableCell className="font-mono text-xs">{r.model}</TableCell>
+                      <TableCell>{r.count}</TableCell>
+                      <TableCell>{perK === null ? "-" : perK.toFixed(3)}</TableCell>
+                      <TableCell>{perK === null ? "-" : `¥${creditsToYuan(perK).toFixed(4)}`}</TableCell>
+                      <TableCell>{perK === null ? "-" : `¥${creditsToYuan(perK * 1000).toFixed(2)}`}</TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
@@ -715,6 +876,96 @@ function ModelStatsDialog({
 // 页面主体
 // ---------------------------------------------------------------------------
 
+/** 服务站点管理：维护经 FRP 等穿透暴露的多个节点地址，公共查询页展示其存活状态。 */
+function SitesPanel() {
+  const [sites, setSites] = useState<api.ProxySite[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    void api
+      .listProxySites()
+      .then((r) => setSites(r.sites))
+      .catch((e) => toast.error("加载站点列表失败", { description: asError(e) }))
+      .finally(() => setLoading(false));
+  }, []);
+
+  function update(idx: number, patch: Partial<api.ProxySite>) {
+    setSites((list) => list.map((s, i) => (i === idx ? { ...s, ...patch } : s)));
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const r = await api.saveProxySites(sites.filter((s) => s.name.trim() && s.url.trim()));
+      setSites(r.sites);
+      toast.success(`站点列表已保存（${r.sites.length} 个）`);
+    } catch (e) {
+      toast.error("保存失败", { description: asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div>
+      <p className="mb-4 text-xs leading-5 text-muted-foreground">
+        站点列表展示在子 Key 用户的查询页（<code>/query</code>）底部，用于告知用户各访问入口的存活状态。
+        存活检测由代理服务器实时探测（60 秒缓存），这里只维护名单。
+      </p>
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" />加载中…
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {sites.map((site, idx) => (
+            <div key={idx} className="flex flex-wrap items-center gap-2">
+              <Input
+                className="h-9 w-40"
+                placeholder="站点名称"
+                value={site.name}
+                onChange={(e) => update(idx, { name: e.target.value })}
+              />
+              <Input
+                className="h-9 min-w-64 flex-1 font-mono text-xs"
+                placeholder="http://frp-node1.example.com:8006"
+                value={site.url}
+                onChange={(e) => update(idx, { url: e.target.value })}
+              />
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-9 px-2 text-destructive"
+                onClick={() => setSites((list) => list.filter((_, i) => i !== idx))}
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            </div>
+          ))}
+          {sites.length === 0 ? (
+            <p className="py-4 text-center text-sm text-muted-foreground">暂无站点，点击下方按钮添加</p>
+          ) : null}
+          <div className="flex items-center gap-2 pt-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setSites((list) => [...list, { name: "", url: "" }])}
+            >
+              <Plus className="size-4" />
+              添加站点
+            </Button>
+            <Button size="sm" onClick={() => void save()} disabled={saving}>
+              {saving ? <Loader2 className="size-4 animate-spin" /> : null}
+              保存站点列表
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ApiProxyPage() {
   const [status, setStatus] = useState<ProxyServerStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -722,9 +973,6 @@ export default function ApiProxyPage() {
   const [mode, setMode] = useState("local");
   const [autoStart, setAutoStart] = useState(false);
   const [upstreamProxy, setUpstreamProxy] = useState("");
-  const [logRetentionDays, setLogRetentionDays] = useState(7);
-  const [logRetentionMaxMb, setLogRetentionMaxMb] = useState(50);
-  const [logContentEnabled, setLogContentEnabled] = useState(true);
   const [toggling, setToggling] = useState(false);
 
   const [upstreamKeys, setUpstreamKeys] = useState<ProxyUpstreamKey[]>([]);
@@ -741,6 +989,7 @@ export default function ApiProxyPage() {
   const [editingSubKey, setEditingSubKey] = useState<ProxySubKey | null>(null);
   const [detail, setDetail] = useState<{ title: string; category: "upstream" | "sub"; keyId: string } | null>(null);
   const [modelStatsKey, setModelStatsKey] = useState<ProxySubKey | null>(null);
+  const [converterOpen, setConverterOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("upstream");
 
   const logBoxRef = useRef<HTMLDivElement>(null);
@@ -752,9 +1001,6 @@ export default function ApiProxyPage() {
     setMode(s.settings?.mode ?? s.mode ?? "local");
     setAutoStart(Boolean(s.settings?.auto_start));
     setUpstreamProxy(s.settings?.upstream_proxy ?? "");
-    setLogRetentionDays(Number(s.settings?.log_retention_days ?? 7));
-    setLogRetentionMaxMb(Number(s.settings?.log_retention_max_mb ?? 50));
-    setLogContentEnabled(s.settings?.log_content_enabled ?? true);
   }, []);
 
   const loadUpstreamKeys = useCallback(async () => {
@@ -1088,43 +1334,19 @@ export default function ApiProxyPage() {
               className="max-w-sm"
             />
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Label className="shrink-0 text-sm text-muted-foreground">日志保留</Label>
-            <Input
-              type="number"
-              min={0}
-              max={365}
-              value={logRetentionDays}
-              onChange={(e) => setLogRetentionDays(Math.min(365, Math.max(0, Number(e.target.value) || 0)))}
-              onBlur={() => void persistSettings({ log_retention_days: logRetentionDays })}
-              className="w-20"
-            />
-            <span className="text-sm text-muted-foreground">天 /</span>
-            <Input
-              type="number"
-              min={0}
-              max={10240}
-              value={logRetentionMaxMb}
-              onChange={(e) => setLogRetentionMaxMb(Math.min(10240, Math.max(0, Number(e.target.value) || 0)))}
-              onBlur={() => void persistSettings({ log_retention_max_mb: logRetentionMaxMb })}
-              className="w-20"
-            />
-            <span className="text-sm text-muted-foreground">MB（0 = 不限制，超限自动删除最旧）</span>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={logContentEnabled}
-                onCheckedChange={(v) => {
-                  setLogContentEnabled(v);
-                  void persistSettings({ log_content_enabled: v });
-                }}
-              />
-              <Label className="text-sm text-muted-foreground">日志记录问答内容（各限 500 字）</Label>
-            </div>
+          <div className="text-xs text-muted-foreground">
+            日志保留与内容记录已移至 设置 →「API 日志」。
           </div>
         </CardContent>
       </Card>
 
       {/* 消耗总览 */}
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm text-muted-foreground">消耗总览</span>
+        <Button size="sm" variant="outline" onClick={() => setConverterOpen(true)}>
+          积分换算 / 模型单价
+        </Button>
+      </div>
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <OverviewMetric label="累计调用" value={overview ? String(Math.round(overview.total.requests)) : "—"} />
         <OverviewMetric
@@ -1135,11 +1357,15 @@ export default function ApiProxyPage() {
         <OverviewMetric
           label="累计积分消耗"
           value={overview ? fmtCredits(overview.total.credits) : "—"}
-          tip={overview ? `精确值 ${overview.total.credits.toFixed(4)}` : undefined}
+          tip={overview ? `精确值 ${overview.total.credits.toFixed(4)} ≈ ${fmtYuan(creditsToYuan(overview.total.credits))}` : undefined}
         />
         <OverviewMetric label="今日调用" value={overview ? String(Math.round(overview.today.requests)) : "—"} />
         <OverviewMetric label="今日 Token" value={overview ? fmtTokens(overview.today.tokens) : "—"} />
-        <OverviewMetric label="今日积分消耗" value={overview ? fmtCredits(overview.today.credits) : "—"} />
+        <OverviewMetric
+          label="今日积分消耗"
+          value={overview ? fmtCredits(overview.today.credits) : "—"}
+          tip={overview ? `≈ ${fmtYuan(creditsToYuan(overview.today.credits))}` : undefined}
+        />
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab}>
@@ -1147,6 +1373,7 @@ export default function ApiProxyPage() {
           <TabsTrigger value="upstream">上游 Key 池</TabsTrigger>
           <TabsTrigger value="subkeys">子 API Keys</TabsTrigger>
           <TabsTrigger value="logs">使用日志</TabsTrigger>
+          <TabsTrigger value="sites">服务站点</TabsTrigger>
         </TabsList>
 
         {/* 上游 Key 池 */}
@@ -1461,6 +1688,11 @@ export default function ApiProxyPage() {
             </div>
           </div>
         </TabsContent>
+
+        {/* 服务站点 */}
+        <TabsContent value="sites" className="mt-4">
+          <SitesPanel />
+        </TabsContent>
       </Tabs>
 
       <ImportAccountsDialog open={importOpen} onOpenChange={setImportOpen} onImported={() => void loadUpstreamKeys()} />
@@ -1488,6 +1720,11 @@ export default function ApiProxyPage() {
           if (!open) setModelStatsKey(null);
         }}
         subKey={modelStatsKey}
+      />
+      <CreditConverterDialog
+        open={converterOpen}
+        onOpenChange={setConverterOpen}
+        subKeys={subKeys}
       />
       <AlertDialog
         open={Boolean(resetTarget)}

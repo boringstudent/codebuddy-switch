@@ -145,6 +145,114 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     account
 }
 
+/// 一键刷新全部账号：无视到期时间，逐个刷新所有带 refresh token 的账号。
+///
+/// 与 `run_keepalive_cycle` 的区别：不做 keepalive_days 过滤，也不把缺 rt 的账号
+/// 标记 needs_relogin（手动批量刷新只报告，不改状态）。
+pub async fn refresh_all_accounts() -> Value {
+    let accounts = crate::modules::account::load_accounts();
+    let total = accounts.len();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut results: Vec<Value> = Vec::new();
+    for acc in accounts {
+        let name = crate::modules::account::account_display_name(&acc);
+        let has_rt = !acc
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
+        if !has_rt {
+            results.push(json!({"name": name, "status": "skipped", "error": "缺少 refresh token"}));
+            continue;
+        }
+        let fresh = refresh_account_token(acc).await;
+        let is_failed = fresh.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true);
+        if is_failed {
+            failed += 1;
+        } else {
+            ok += 1;
+        }
+        results.push(json!({
+            "name": name,
+            "status": if is_failed { "failed" } else { "ok" },
+            "error": if is_failed {
+                fresh.get("needs_relogin_reason").and_then(|v| v.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            },
+        }));
+    }
+    json!({"total": total, "ok": ok, "failed": failed, "results": results})
+}
+
+// ---------------------------------------------------------------------------
+// 定时自动刷新
+// ---------------------------------------------------------------------------
+
+/// 自动刷新配置文件。
+fn auto_refresh_config_file() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join("auto_refresh_config.json")
+}
+
+/// 读取自动刷新配置：`{enabled, interval_hours, last_run_at}`。
+pub fn load_auto_refresh_config() -> Value {
+    let text = std::fs::read_to_string(auto_refresh_config_file()).unwrap_or_default();
+    let mut cfg: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    if !cfg.is_object() {
+        cfg = json!({});
+    }
+    if cfg.get("enabled").is_none() {
+        cfg["enabled"] = json!(false);
+    }
+    if cfg
+        .get("interval_hours")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        <= 0
+    {
+        cfg["interval_hours"] = json!(12);
+    }
+    cfg
+}
+
+/// 保存自动刷新配置（合并写，保留 last_run_at 等运行时字段）。
+pub fn save_auto_refresh_config(patch: &Value) -> Value {
+    let mut cfg = load_auto_refresh_config();
+    if let (Some(dst), Some(src)) = (cfg.as_object_mut(), patch.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    let _ = crate::modules::config::atomic_write(
+        &auto_refresh_config_file(),
+        &serde_json::to_string_pretty(&cfg).unwrap_or_default(),
+    );
+    cfg
+}
+
+/// 后台定时循环调用：到点则全量刷新并记录 last_run_at。
+pub async fn run_auto_refresh_if_due() -> Value {
+    let cfg = load_auto_refresh_config();
+    if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return json!({"skipped": "disabled"});
+    }
+    let interval_ms = cfg
+        .get("interval_hours")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(12)
+        .max(1)
+        * 3600
+        * 1000;
+    let last = cfg.get("last_run_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    if now_ms() - last < interval_ms {
+        return json!({"skipped": "not_due"});
+    }
+    let result = refresh_all_accounts().await;
+    save_auto_refresh_config(&json!({"last_run_at": now_ms()}));
+    result
+}
+
 /// 惰性刷新：expiresAt 缺失或剩余 < lazy_refresh_hours 则刷新。返回最新账号。
 pub async fn ensure_fresh_token(mut account: Value, cfg: &Value) -> Value {
     let lazy_h = cfg

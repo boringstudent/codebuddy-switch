@@ -3,10 +3,6 @@ import type {
   AccountMeta,
   AppNotification,
   AppStatus,
-  AutoRotateConfig,
-  CodeBuddyCliInstallResult,
-  CodeBuddyCliStatus,
-  CodeBuddyCliSwitchResult,
   CodeBuddyCnIdeStatus,
   CodeBuddyCnIdeSwitchResult,
   CheckinConfig,
@@ -24,26 +20,11 @@ import type {
   RateLimitConfig,
   RateLimitHookStatus,
   RateLimitsPayload,
-  RotateLog,
-  RotateStatus,
   Session,
-  SessionCopyReport,
-  SessionLinksPreview,
-  SessionSyncReport,
   SessionSyncSelection,
-  SessionSyncMode,
-  SessionGroupClient,
-  SessionGroupList,
-  SessionGroupDetail,
-  SessionGroupPairPreview,
-  SessionGroupActionReport,
   SwitchResult,
   TravelConfig,
   TravelStatus,
-  VscodeExtStatus,
-  VscodeExtSwitchResult,
-  JetbrainsStatus,
-  JetbrainsSwitchResult,
   ProxyDailyStat,
   ProxyImportableAccount,
   ProxyOverview,
@@ -72,10 +53,6 @@ export function isDesktop(): boolean {
   return !isMobilePlatform();
 }
 
-/** Agent Companion 只由桌面宿主管理。 */
-function requireCompanionDesktop(): void {
-  if (!isDesktop()) throw new Error("Agent Companion 仅在桌面版中可用");
-}
 /**
  * 档位参数只在国际版时下发：缺省（国内版）保持改造前的请求体逐字一致。
  */
@@ -100,27 +77,6 @@ export function getStatus(variant?: WbVariant): Promise<AppStatus> {
 /** 返回全部档位的账号，由调用方按 `variant` 过滤。 */
 export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
   return call("get_accounts");
-}
-
-export function getCodebuddyCliStatus(): Promise<CodeBuddyCliStatus> {
-  return call("get_codebuddy_cli_status");
-}
-
-export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> {
-  return call("install_codebuddy_cli_helper");
-}
-
-/**
- * 切换 CodeBuddy CLI 默认账号。
- *
- * @param closeRunningCli 已废弃：后端一律先关闭正在运行的 CLI 再写状态，该入参被忽略。
- *   仅为兼容既有调用方保留（HTTP 路径仍会原样发送）。
- */
-export function switchCodebuddyCliAccount(
-  accountId: string,
-  closeRunningCli = false,
-): Promise<CodeBuddyCliSwitchResult> {
-  return call("switch_codebuddy_cli_account", { accountId, closeRunningCli });
 }
 
 export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
@@ -148,17 +104,6 @@ export function listCodebuddyIdeSessions(): Promise<VscodeSessionList> {
   return call("list_codebuddy_ide_sessions");
 }
 
-/**
- * 预览「当前 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
- *
- * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
- */
-export function codebuddyIdeSessionLinksPreview(
-  targetAccountId: string,
-): Promise<SessionLinksPreview> {
-  return call("codebuddy_ide_session_links_preview", { targetAccountId });
-}
-
 export function detectCodebuddyCnIdeAccount(): Promise<{
   ok: boolean;
   found: boolean;
@@ -167,80 +112,6 @@ export function detectCodebuddyCnIdeAccount(): Promise<{
   message?: string;
 }> {
   return call("detect_codebuddy_cn_ide_account");
-}
-
-export function getVscodeExtStatus(): Promise<VscodeExtStatus> {
-  return call("get_vscode_ext_status");
-}
-
-/** 列出当前 VS Code 扩展账号可复制的会话（未安装/未登录时返回空列表）。 */
-export function listVscodeSessions(): Promise<VscodeSessionList> {
-  return call("list_vscode_sessions");
-}
-
-/**
- * 预览「当前 VS Code CodeBuddy 插件账号 → 目标账号」可同步的关联会话。
- *
- * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
- */
-export function vscodeSessionLinksPreview(targetAccountId: string): Promise<SessionLinksPreview> {
-  return call("vscode_session_links_preview", { targetAccountId });
-}
-
-/**
- * 切换 VS Code CodeBuddy 扩展账号。
- *
- * `restart` 默认 true：VS Code 运行时由后端先优雅退出、写入后再重新打开；
- * 传 false 退回「请先完全退出 VS Code」的手动模式（不在编辑器中自动操作）。
- * `syncSelections` 与 WorkBuddy 侧同形；只传它（不传 `copySessions`）也能执行同步。
- */
-export function switchVscodeExtAccount(
-  accountId: string,
-  restart = true,
-  copySessions?: VscodeSessionRef[],
-  syncSelections?: SessionSyncSelection[],
-): Promise<VscodeExtSwitchResult> {
-  return call("switch_vscode_ext_account", { accountId, restart, copySessions, syncSelections });
-}
-
-export function detectVscodeExtAccount(): Promise<{
-  ok: boolean;
-  found: boolean;
-  matched?: boolean;
-  accountId?: string;
-  message?: string;
-}> {
-  return call("detect_vscode_ext_account");
-}
-
-export function getJetbrainsStatus(): Promise<JetbrainsStatus> {
-  return call("get_jetbrains_status");
-}
-
-/**
- * 切换 JetBrains IDE（IDEA / PyCharm）CodeBuddy 插件账号。
- *
- * `restart` 默认 true：IDE 运行时由后端先优雅退出、写入后再重新打开；
- * 传 false 退回「请先完全退出 IDE」的手动模式（不在 IDE 中自动操作）。
- * `configDirs` 可选：目标配置目录名列表（如 ["PyCharm2026.2"]），缺省 / 空
- * = 全部装了插件的 IDE；非空时只写所选目录、只关闭/重开这些目录的运行实例。
- */
-export function switchJetbrainsAccount(
-  accountId: string,
-  restart = true,
-  configDirs?: string[],
-): Promise<JetbrainsSwitchResult> {
-  return call("switch_jetbrains_account", { accountId, restart, configDirs });
-}
-
-export function detectJetbrainsAccount(): Promise<{
-  ok: boolean;
-  found: boolean;
-  matched?: boolean;
-  accountId?: string;
-  message?: string;
-}> {
-  return call("detect_jetbrains_account");
 }
 
 export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
@@ -266,17 +137,6 @@ export function switchCodebuddyIdeAccount(
 /** 列出当前国际版 CodeBuddy IDE 账号可复制的会话（未登录/未安装时返回空列表）。 */
 export function listCodebuddyIntlIdeSessions(): Promise<VscodeSessionList> {
   return call("list_codebuddy_intl_ide_sessions");
-}
-
-/**
- * 预览「当前国际版 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
- *
- * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
- */
-export function codebuddyIntlIdeSessionLinksPreview(
-  targetAccountId: string,
-): Promise<SessionLinksPreview> {
-  return call("codebuddy_intl_ide_session_links_preview", { targetAccountId });
 }
 
 export function detectCodebuddyIdeAccount(): Promise<{
@@ -319,6 +179,13 @@ export function importLocal(variant?: WbVariant): Promise<{ ok: boolean; account
   return call("import_local", variantArgs(variant));
 }
 
+/** 按账号 id 列表返回完整记录（含 token）。仅用于导出备份 / 上传到云端账号仓库。 */
+export function exportAccounts(
+  accountIds: string[],
+): Promise<{ ok: boolean; accounts: Array<Record<string, unknown>> }> {
+  return call("export_accounts", { accountIds });
+}
+
 /** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
 export function exportAccountsToPath(
   accountIds: string[],
@@ -355,184 +222,6 @@ export function listSessions(variant?: WbVariant): Promise<{
   return call("list_sessions", variantArgs(variant));
 }
 
-/** 指定账号名下的会话列表（会话管理页的源账号视角）；账号不存在时后端返回明确错误。 */
-export function listAccountSessions(accountId: string, client?: SessionGroupClient): Promise<{
-  /** 插件侧会话没有 `cwd`（只有 `workspaceHash`）：调用方补齐默认值后再交给会话树。 */
-  sessions: (Omit<Session, "cwd"> & { cwd?: string })[];
-  current: string | null;
-  variant?: WbVariant;
-  /** 插件侧：插件数据仓根目录（`null` = 未找到目录，与「该账号无会话」区分）。 */
-  dataRoot?: string | null;
-  sourceUid?: string;
-}> {
-  return call("list_account_sessions", { accountId, ...(client ? { client } : {}) });
-}
-
-/** 把勾选会话复制到指定账号；返回 core 同形的复制报告（copied / alreadyLinked / errors）。 */
-export function copySessions(
-  targetAccountId: string,
-  sessionIds: string[],
-): Promise<SessionCopyReport & { variant?: WbVariant }> {
-  return call("copy_sessions", { targetAccountId, sessionIds });
-}
-
-/**
- * 跨档把会话从**显式源账号**复制到**显式目标账号**（会话管理页用）。
- *
- * 与 `copySessions` 同形，只多一个 `sourceAccountId`：源可为国内版或国际版账号，
- * 不再要求源是当前登录账号；报告另带 `sourceVariant` / `targetVariant`。
- */
-export function copySessionsCross(
-  sourceAccountId: string,
-  targetAccountId: string,
-  sessionIds: string[],
-): Promise<SessionCopyReport & { variant?: WbVariant }> {
-  return call("copy_sessions_cross", { sourceAccountId, targetAccountId, sessionIds });
-}
-
-/**
- * 预览「当前账号 → 目标账号」可同步的关联会话（只读）。
- *
- * 默认勾选与可选模式都来自后端：前端只按 `defaultChecked` / `availableModes` 渲染，
- * 不自行扩大权限。`variant` 缺省由后端取目标账号自身档位。
- */
-export function sessionLinksPreview(
-  targetAccountId: string,
-  variant?: WbVariant,
-): Promise<SessionLinksPreview> {
-  const args: Record<string, unknown> = { targetAccountId };
-  if (variant === "ai") args.variant = variant;
-  return call("session_links_preview", args);
-}
-
-/**
- * 预览「显式来源账号 → 显式目标账号」可同步的关联会话（只读；跨档支持）。
- *
- * 与 `sessionLinksPreview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取
- * （跨档组的源读源档、目标读目标档）。报告在跨档时带 `sourceVariant` / `targetVariant`。
- */
-export function sessionLinksPreviewCross(
-  sourceAccountId: string,
-  targetAccountId: string,
-): Promise<SessionLinksPreview> {
-  return call("session_links_preview_cross", { sourceAccountId, targetAccountId });
-}
-
-/**
- * 把显式来源账号的新增同步到显式目标账号（跨档支持；会话管理页用）。
- *
- * `syncSelections` 与切号弹窗同形（含预览凭据，执行时后端逐项复核）；
- * 目标档客户端运行时会返回明确错误（不写半成品）。
- */
-export function sessionSyncCross(
-  sourceAccountId: string,
-  targetAccountId: string,
-  syncSelections: SessionSyncSelection[],
-): Promise<SessionSyncReport> {
-  return call("session_sync_cross", { sourceAccountId, targetAccountId, syncSelections });
-}
-
-export function listSessionGroups(client: SessionGroupClient, variantScope?: WbVariant): Promise<SessionGroupList> {
-  return call("list_session_groups", { client, ...(variantScope ? { variantScope } : {}) });
-}
-
-export function getSessionGroup(client: SessionGroupClient, groupId: string, variantScope?: WbVariant): Promise<SessionGroupDetail> {
-  return call("get_session_group", { client, groupId, ...(variantScope ? { variantScope } : {}) });
-}
-
-export function previewSessionGroupPair(args: {
-  client: SessionGroupClient;
-  groupId: string;
-  sourceMemberId: string;
-  targetMemberId: string;
-  variantScope?: WbVariant;
-}): Promise<SessionGroupPairPreview> {
-  return call("preview_session_group_pair", args as unknown as Record<string, unknown>);
-}
-
-export function syncSessionGroupPair(args: {
-  client: SessionGroupClient;
-  groupId: string;
-  sourceMemberId: string;
-  targetMemberId: string;
-  previewToken: string;
-  mode: SessionSyncMode;
-  variantScope?: WbVariant;
-  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
-  restart?: boolean;
-}): Promise<SessionGroupActionReport> {
-  return call("sync_session_group_pair", args as unknown as Record<string, unknown>);
-}
-
-export function syncSessionGroupUnify(args: {
-  client: "workbuddy" | "vscodeExt";
-  groupId: string;
-  sourceMemberId: string;
-  targets: { targetMemberId: string; previewToken: string; mode: SessionSyncMode }[];
-  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
-  restart?: boolean;
-}): Promise<SessionGroupActionReport> {
-  return call("sync_session_group_unify", args as unknown as Record<string, unknown>);
-}
-
-export function syncSessionGroupSafeBatch(client: SessionGroupClient, groupId: string, variantScope?: WbVariant, restart?: boolean): Promise<SessionGroupActionReport> {
-  return call("sync_session_group_safe_batch", { client, groupId, ...(variantScope ? { variantScope } : {}), ...(restart ? { restart: true } : {}) });
-}
-
-export function addSessionGroupMember(args: {
-  client: SessionGroupClient;
-  groupId: string;
-  sourceMemberId: string;
-  targetAccountId: string;
-  variantScope?: WbVariant;
-  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
-  restart?: boolean;
-}): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; /** 内容缺失 / 索引丢失而被跳过的会话。 */ skipped?: { id: string; error: string }[]; [key: string]: unknown }> {
-  return call("add_session_group_member", args as unknown as Record<string, unknown>);
-}
-
-/** 插件：把来源账号的勾选会话复制到目标账号并登记关联（无现成组则新建关联组）。 */
-export function copyLinkedSessions(args: {
-  client: SessionGroupClient;
-  sourceAccountId: string;
-  targetAccountId: string;
-  sessionIds: string[];
-  /** 已获用户授权（确认框）时传 `true`：运行中允许关闭并重开 VS Code。 */
-  restart?: boolean;
-}): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; [key: string]: unknown }> {
-  return call("copy_linked_sessions", args as unknown as Record<string, unknown>);
-}
-
-/** 预检：当前是否需要关闭 VS Code（运行中 且 目标账号含当前登录账号）；供前端决定是否先弹确认框。 */
-export function vscodeRestartPrecheck(targetAccountIds: string[]): Promise<{ required: boolean; running: boolean }> {
-  return call("vscode_restart_precheck", { targetAccountIds });
-}
-
-/**
- * 取消关联：把成员从会话组移除（只解除管理关系，不删除账号内的会话内容）。
- *
- * `groupRemoved` 表示移除后组内已无成员，该组已被删除。
- */
-export function unlinkSessionGroupMember(args: {
-  client: SessionGroupClient;
-  groupId: string;
-  memberId: string;
-  variantScope?: WbVariant;
-}): Promise<{ status: "removed" | "groupRemoved"; client: SessionGroupClient; groupId: string; memberId: string; remaining: number }> {
-  return call("unlink_session_group_member", args as unknown as Record<string, unknown>);
-}
-
-/**
- * 删除会话组：组内所有成员一起解除关联（只解除管理关系，不删除账号内的会话内容）。
- */
-export function deleteSessionGroup(args: {
-  client: SessionGroupClient;
-  groupId: string;
-  variantScope?: WbVariant;
-}): Promise<{ status: "groupRemoved"; client: SessionGroupClient; groupId: string; removed: number }> {
-  return call("delete_session_group", args as unknown as Record<string, unknown>);
-}
-
 /** 打开系统设置授权面板。 */
 export function openPermissionSettings(
   target?: "app_management" | "all_files",
@@ -554,35 +243,6 @@ export function checkAuthPermission(variant?: WbVariant): Promise<{
 /** 在 Finder 中显示当前 App。 */
 export function revealAppInFinder(): Promise<void> {
   return call("reveal_app_in_finder");
-}
-
-/** 后端持久化的悬浮栏启用状态；默认值由后端决定。 */
-export function getCompanionEnabled(): Promise<boolean> {
-  try {
-    requireCompanionDesktop();
-    return call("get_companion_enabled");
-  } catch (error) {
-    return Promise.reject(error);
-  }
-}
-
-/** 返回后端确认的最终状态，不在前端单独持久化。 */
-export function setCompanionEnabled(enabled: boolean): Promise<boolean> {
-  try {
-    requireCompanionDesktop();
-    return call("set_companion_enabled", { enabled });
-  } catch (error) {
-    return Promise.reject(error);
-  }
-}
-
-export function openCompanionSettings(): Promise<void> {
-  try {
-    requireCompanionDesktop();
-    return call("open_companion_settings");
-  } catch (error) {
-    return Promise.reject(error);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,39 +362,112 @@ export function saveAutoTravelConfig(config: TravelConfig): Promise<TravelConfig
   });
 }
 
-export function getAutoRotateConfig(): Promise<AutoRotateConfig> {
-  return call("get_auto_rotate_config");
+/** 一键刷新全部账号 token；返回 `{total, ok, failed, results:[{name,status,error}]}`。 */
+export function refreshAllAccounts(): Promise<{
+  total: number;
+  ok: number;
+  failed: number;
+  results: { name: string; status: string; error?: string }[];
+}> {
+  return call("refresh_all_accounts");
 }
 
-export function saveAutoRotateConfig(config: AutoRotateConfig): Promise<AutoRotateConfig> {
-  return call("save_auto_rotate_config", {
+/** 服务站点列表（FRP 多节点；管理端可读，公共页只展示存活状态）。 */
+export interface ProxySite {
+  name: string;
+  url: string;
+}
+
+export function listProxySites(): Promise<{ sites: ProxySite[] }> {
+  return call("list_proxy_sites");
+}
+
+export function saveProxySites(sites: ProxySite[]): Promise<{ sites: ProxySite[] }> {
+  return call("save_proxy_sites", {
+    sites: sites as unknown as Record<string, unknown>[],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 模型目录（模型管理页）
+// ---------------------------------------------------------------------------
+
+export interface CatalogModel {
+  id: string;
+  name?: string;
+  context_length?: number;
+  thinking_levels?: unknown[];
+  /** 思考强度默认档位（服务器 defaultEffort）。 */
+  default_effort?: string;
+  only_reasoning?: boolean;
+  /** Max 模式对应的最大上下文档位（tokens）。 */
+  max_mode?: unknown;
+  /** 积分倍率（服务器 credits "x0.79" 解析值）。 */
+  credits_multiplier?: number;
+  max_output_tokens?: number;
+  /** 官方返回原文，未识别字段都在这里。 */
+  raw?: Record<string, unknown>;
+}
+
+export interface ModelCatalog {
+  models: CatalogModel[];
+  updated_at?: number;
+  source?: string;
+  auto_update: boolean;
+  update_interval_hours: number;
+}
+
+export function getModelCatalog(): Promise<ModelCatalog> {
+  return call("get_model_catalog");
+}
+
+/** 立即从 CodeBuddy CN API 拉取模型列表；返回 `{ok, count?, source?, error?, catalog?}`。 */
+export function refreshModelCatalog(): Promise<{
+  ok: boolean;
+  count?: number;
+  source?: string;
+  error?: string;
+  catalog?: ModelCatalog;
+}> {
+  return call("refresh_model_catalog");
+}
+
+/** 从客户端产品配置缓存读取服务器原样下发的完整模型参数（不联网、字段最全）。 */
+export function refreshModelCatalogClientCache(): Promise<{
+  ok: boolean;
+  count?: number;
+  source?: string;
+  error?: string;
+  catalog?: ModelCatalog;
+}> {
+  return call("refresh_model_catalog_client_cache");
+}
+
+export function saveModelCatalogConfig(config: {
+  auto_update: boolean;
+  update_interval_hours: number;
+}): Promise<ModelCatalog> {
+  return call("save_model_catalog_config", {
     config: config as unknown as Record<string, unknown>,
   });
 }
 
-export function getRotateStatus(): Promise<RotateStatus> {
-  return call("rotate_status");
-}
-
-/**
- * 手动触发一次轮换检查。
- *
- * `notify`（可选）：因存活门控被推迟、但除门控外本来会切换时由 core 组装好的提示内容。
- * 桌面端由宿主（Rust）直接投递系统通知，这里只保留字段以描述完整返回契约；
- * 无头 server 不投递，调用方按需自行处理。
- */
-export function runRotate(): Promise<{
-  status: string;
-  reason?: string;
-  error?: string;
-  to?: string;
-  notify?: { title: string; body: string };
+/** 定时刷新配置：`{enabled, interval_hours, last_run_at?}`。 */
+export function getAutoRefreshConfig(): Promise<{
+  enabled: boolean;
+  interval_hours: number;
+  last_run_at?: number;
 }> {
-  return call("run_rotate");
+  return call("get_auto_refresh_config");
 }
 
-export function getRotateLogs(): Promise<{ logs: RotateLog[] }> {
-  return call("get_rotate_logs");
+export function saveAutoRefreshConfig(config: {
+  enabled: boolean;
+  interval_hours: number;
+}): Promise<{ enabled: boolean; interval_hours: number; last_run_at?: number }> {
+  return call("save_auto_refresh_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
 }
 
 export function refreshAccountToken(accountId: string): Promise<AccountMeta> {
@@ -892,6 +625,22 @@ export function getProxyLogs(since = 0, limit = 200): Promise<{ logs: ProxyReque
 
 export function clearProxyLogs(): Promise<{ ok: boolean }> {
   return call("clear_proxy_logs");
+}
+
+/** 一键导出全部数据（账号库 + 代理设置 + 上游/子 Key + 请求日志）到指定路径。 */
+export function exportAllData(path: string): Promise<{ ok: boolean; path: string }> {
+  return call("export_all_data", { path });
+}
+
+/** 从备份文件一键导入：账号按 uid 合并，Key 去重追加，返回各项计数。 */
+export function importAllData(path: string): Promise<{
+  ok: boolean;
+  result: {
+    accounts?: { imported: number; skipped: number; overwritten: number };
+    proxy?: { upstream_added: number; sub_keys_added: number };
+  };
+}> {
+  return call("import_all_data", { path });
 }
 
 export function getProxyDailyStats(

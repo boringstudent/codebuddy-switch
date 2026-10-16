@@ -4,11 +4,8 @@ import { DEFAULT_VARIANT, normalizeVariant } from "@/lib/variant";
 import type {
   AccountMeta,
   AppStatus,
-  CodeBuddyCliStatus,
   CodeBuddyCnIdeStatus,
   CreditExpiry,
-  JetbrainsStatus,
-  VscodeExtStatus,
   WbVariant,
 } from "@/lib/types";
 
@@ -37,17 +34,11 @@ async function fetchCreditExpiry(id: string): Promise<CreditExpiry> {
 
 /** 各客户端最近一次读到的状态（账号页顶栏徽标与卡片入口共用）。 */
 export interface ClientStatusSnapshot {
-  codebuddyCli: CodeBuddyCliStatus | null;
   codebuddyCnIde: CodeBuddyCnIdeStatus | null;
-  vscodeExt: VscodeExtStatus | null;
-  jetbrains: JetbrainsStatus | null;
 }
 
 const EMPTY_CLIENT_STATUS: ClientStatusSnapshot = {
-  codebuddyCli: null,
   codebuddyCnIde: null,
-  vscodeExt: null,
-  jetbrains: null,
 };
 
 interface AccountsState {

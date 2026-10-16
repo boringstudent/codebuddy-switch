@@ -1,11 +1,12 @@
 import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ChartColumn, Network, Settings, User } from "lucide-react";
+import { ChartColumn, ListTree, Network, Settings, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import AccountsPage from "@/pages/AccountsPage";
 import UsageStatsPage from "@/pages/UsageStatsPage";
 import ApiProxyPage from "@/pages/ApiProxyPage";
+import ModelsPage from "@/pages/ModelsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { AppIconMark } from "@/components/product-marks";
 import { Toaster } from "@/components/ui/sonner";
@@ -93,6 +94,20 @@ function Layout() {
             API 代理
           </NavLink>
           <NavLink
+            to="/models"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <ListTree className="size-4" />
+            模型管理
+          </NavLink>
+          <NavLink
             to="/settings"
             className={({ isActive }) =>
               cn(
@@ -131,6 +146,7 @@ export default function App() {
             <Route path="/credit-stats" element={<Navigate to="/usage-stats" replace />} />
             <Route path="/token-stats" element={<Navigate to="/usage-stats" replace />} />
             <Route path="/api-proxy" element={<ApiProxyPage />} />
+            <Route path="/models" element={<ModelsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

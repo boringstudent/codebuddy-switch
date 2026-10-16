@@ -27,6 +27,13 @@ import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
+import {
+  loadCloudSyncConfig,
+  probeCloud,
+  saveCloudSyncConfig,
+  uploadAccountsToCloud,
+  type CloudSyncConfig,
+} from "@/lib/cloud-sync";
 import { canPersistErrorLog } from "@/lib/error-report";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import { SUPPORTED_TOOLS, setToolEnabled, useSupportedTools, type ToolId } from "@/lib/supported-tools";
@@ -612,8 +619,8 @@ function AutoCheckinCard() {
                     label="签到时间段"
                     description={
                       <>
-                        留空为不限制。设置后每天在窗口内随机时刻自动签到。
-                        <span className="mt-0.5 block">需 App 在窗口附近运行才能按时执行。</span>
+                        默认每天 <b>00:10</b> 触发。设置后每天在窗口内自动签到（账号按窗口分散）。
+                        <span className="mt-0.5 block">留空为不限制；需 App 在窗口附近运行才能按时执行。</span>
                       </>
                     }
                   >
@@ -1374,6 +1381,347 @@ function RateLimitCard() {
 }
 
 /** 设置页。 */
+/**
+ * 云端账号同步：把本地账号库（含 token）上传到 EO 边缘函数持久化的私有 GitHub 仓库，
+ * 供 GitHub Actions 每日签到工作流拉取。访问 key 只存本机 localStorage，等同密码。
+ */
+function CloudSyncCard() {
+  const accounts = useAccountsStore((s) => s.accounts);
+  const [draft, setDraft] = useState<CloudSyncConfig>(() => loadCloudSyncConfig());
+  const [saved, setSaved] = useState<CloudSyncConfig>(() => loadCloudSyncConfig());
+  const [probing, setProbing] = useState(false);
+  const [uploading, setUploading] = useState(false);
+
+  const dirty = draft.url.trim() !== saved.url.trim() || draft.accessKey.trim() !== saved.accessKey.trim();
+
+  function persist() {
+    const next = { url: draft.url.trim(), accessKey: draft.accessKey.trim() };
+    saveCloudSyncConfig(next);
+    setDraft(next);
+    setSaved(next);
+    toast.success("云端同步配置已保存");
+  }
+
+  async function probe() {
+    setProbing(true);
+    try {
+      const result = await probeCloud(draft);
+      if (result.ok) toast.success("连接正常", { description: result.detail });
+      else toast.error("连接异常", { description: result.detail });
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  async function upload() {
+    if (dirty) persist();
+    setUploading(true);
+    try {
+      const ids = accounts.map((a) => a.id);
+      const result = await uploadAccountsToCloud(draft, ids);
+      toast.success("已上传到云端", {
+        description: `云端共 ${result.total} 个账号（更新 ${result.updated}，新增 ${result.added}）。签到工作流下次运行即用最新 token。`,
+      });
+    } catch (e) {
+      toast.error("上传失败", { description: api.asError(e) });
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-cloud-sync" title="云端账号同步">
+      <CardContent className="space-y-0 p-0">
+        <div className="border-b border-border/50 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+          把账号库（含登录 token）合并写入 EO 边缘函数背后的私有 GitHub 仓库，供每日签到工作流使用。
+          账号有变动（新增 / 删除 / 重新登录）后再点一次「上传到云端」即可。
+        </div>
+        <SettingsFieldRow
+          label="函数地址"
+          description="EO 边缘函数触发域名，可只填域名"
+          htmlFor="cloud-sync-url"
+        >
+          <Input
+            id="cloud-sync-url"
+            className="h-8 w-full text-xs sm:w-72"
+            placeholder="https://xxx.eo-edgefunctions.com"
+            value={draft.url}
+            onChange={(e) => setDraft((d) => ({ ...d, url: e.target.value }))}
+          />
+        </SettingsFieldRow>
+        <SettingsFieldRow
+          label="访问 key"
+          description="与 EO 函数环境变量 ACCESS_KEY 一致，只保存在本机"
+          htmlFor="cloud-sync-key"
+        >
+          <Input
+            id="cloud-sync-key"
+            type="password"
+            className="h-8 w-full text-xs sm:w-72"
+            placeholder="ACCESS_KEY"
+            value={draft.accessKey}
+            onChange={(e) => setDraft((d) => ({ ...d, accessKey: e.target.value }))}
+          />
+        </SettingsFieldRow>
+        <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
+          <Button size="sm" variant="outline" disabled={!dirty} onClick={persist}>
+            保存配置
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={probing || !draft.url.trim()}
+            onClick={() => void probe()}
+          >
+            {probing ? <Loader2 className="animate-spin" /> : null}测试连接
+          </Button>
+          <Button
+            size="sm"
+            disabled={uploading || !draft.url.trim() || !draft.accessKey.trim() || accounts.length === 0}
+            onClick={() => void upload()}
+          >
+            {uploading ? <Loader2 className="animate-spin" /> : null}上传到云端（{accounts.length}）
+          </Button>
+        </div>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * API 日志设置：代理服务的日志保留天数 / 体积上限 / 是否记录问答内容。
+ * 原来在「API 代理」页内，移到设置页统一管理。
+ */
+function ProxyLogSettingsCard() {
+  const [retentionDays, setRetentionDays] = useState(7);
+  const [retentionMaxMb, setRetentionMaxMb] = useState(50);
+  const [contentEnabled, setContentEnabled] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    api
+      .getProxyStatus()
+      .then((s) => {
+        setRetentionDays(Number(s.settings?.log_retention_days ?? 7));
+        setRetentionMaxMb(Number(s.settings?.log_retention_max_mb ?? 50));
+        setContentEnabled(s.settings?.log_content_enabled ?? true);
+      })
+      .catch(() => {})
+      .finally(() => setLoaded(true));
+  }, []);
+
+  async function persist(patch: Record<string, unknown>) {
+    try {
+      await api.saveProxySettings(patch);
+    } catch (e) {
+      toast.error("保存日志设置失败", { description: api.asError(e) });
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-proxy-log" title="API 日志">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label="日志保留天数"
+          description="超过天数的请求日志自动删除，0 = 不限制"
+          htmlFor="proxy-log-days"
+        >
+          <Input
+            id="proxy-log-days"
+            type="number"
+            min={0}
+            max={365}
+            disabled={!loaded}
+            className="h-8 w-24 text-xs"
+            value={retentionDays}
+            onChange={(e) => setRetentionDays(Math.min(365, Math.max(0, Number(e.target.value) || 0)))}
+            onBlur={() => void persist({ log_retention_days: retentionDays })}
+          />
+        </SettingsFieldRow>
+        <SettingsFieldRow
+          label="日志体积上限"
+          description="单位 MB，0 = 不限制，超限自动删除最旧日志"
+          htmlFor="proxy-log-mb"
+        >
+          <Input
+            id="proxy-log-mb"
+            type="number"
+            min={0}
+            max={10240}
+            disabled={!loaded}
+            className="h-8 w-24 text-xs"
+            value={retentionMaxMb}
+            onChange={(e) => setRetentionMaxMb(Math.min(10240, Math.max(0, Number(e.target.value) || 0)))}
+            onBlur={() => void persist({ log_retention_max_mb: retentionMaxMb })}
+          />
+        </SettingsFieldRow>
+        <SettingsFieldRow
+          label="记录问答内容"
+          description="请求日志中保存提问与回答摘要（各限 500 字），关闭后只记录元数据"
+          htmlFor="proxy-log-content"
+        >
+          <Switch
+            id="proxy-log-content"
+            disabled={!loaded}
+            checked={contentEnabled}
+            onCheckedChange={(v) => {
+              setContentEnabled(v);
+              void persist({ log_content_enabled: v });
+            }}
+          />
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 一键导入 / 导出全部数据：账号库（含 token）+ 代理设置 + 上游/子 Key + 请求日志。
+ * 备份文件含完整凭据，仅本机保存，切勿外传。
+ */
+function DataBackupCard() {
+  const accounts = useAccountsStore((s) => s.accounts);
+  const refreshAccounts = useAccountsStore((s) => s.fetchAll);
+  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+
+  async function exportAll() {
+    setBusy("export");
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const date = new Date().toISOString().slice(0, 10);
+      const path = await save({
+        title: "导出全部数据",
+        defaultPath: `wb-switch-backup-${date}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      const res = await api.exportAllData(path);
+      toast.success("已导出全部数据", { description: res.path });
+    } catch (e) {
+      toast.error("导出失败", { description: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function importAll() {
+    setBusy("import");
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        title: "选择备份文件",
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected || typeof selected !== "string") return;
+      const res = await api.importAllData(selected);
+      const acc = res.result.accounts;
+      const proxy = res.result.proxy;
+      const parts = [
+        acc ? `账号导入 ${acc.imported}（覆盖 ${acc.overwritten}，跳过 ${acc.skipped}）` : null,
+        proxy ? `上游 Key +${proxy.upstream_added}，子 Key +${proxy.sub_keys_added}` : null,
+        "代理设置已合并",
+      ].filter(Boolean);
+      toast.success("导入完成", { description: parts.join("；") });
+      void refreshAccounts();
+    } catch (e) {
+      toast.error("导入失败", { description: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-data-backup" title="数据备份">
+      <CardContent className="space-y-0 p-0">
+        <div className="border-b border-border/50 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+          一键导出账号库（含登录 token）、API 代理设置、上游/子 Key 与请求日志为单个 JSON 备份文件；
+          导入时账号按 uid 合并、Key 去重追加，不会删除现有数据。
+          备份文件含完整凭据，请妥善保管。
+        </div>
+        <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
+          <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void exportAll()}>
+            {busy === "export" ? <Loader2 className="animate-spin" /> : null}
+            导出全部数据
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void importAll()}>
+            {busy === "import" ? <Loader2 className="animate-spin" /> : null}
+            导入备份…
+          </Button>
+          <span className="self-center text-xs text-muted-foreground">
+            当前账号 {accounts.length} 个
+          </span>
+        </div>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** Token 定时刷新：后台按设定间隔自动刷新全部账号 token（含未到期），避免 refresh token 闲置失效。 */
+function AutoRefreshCard() {
+  const [enabled, setEnabled] = useState(false);
+  const [hours, setHours] = useState(12);
+  const [lastRunAt, setLastRunAt] = useState<number | undefined>(undefined);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    void api.getAutoRefreshConfig().then((cfg) => {
+      setEnabled(cfg.enabled);
+      setHours(cfg.interval_hours || 12);
+      setLastRunAt(cfg.last_run_at);
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  async function persist(nextEnabled: boolean, nextHours: number) {
+    setSaving(true);
+    try {
+      const cfg = await api.saveAutoRefreshConfig({ enabled: nextEnabled, interval_hours: nextHours });
+      setEnabled(cfg.enabled);
+      setHours(cfg.interval_hours);
+      setLastRunAt(cfg.last_run_at);
+      toast.success("定时刷新设置已保存");
+    } catch (e) {
+      toast.error("保存失败", { description: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-auto-refresh" title="Token 定时刷新">
+      <CardContent className="space-y-0 p-0">
+        <div className="border-b border-border/50 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+          开启后后台按固定间隔自动刷新全部账号的 token（含未到期账号），避免 refresh token 闲置被服务端清理。
+          {lastRunAt ? ` 上次自动刷新：${new Date(lastRunAt).toLocaleString()}。` : ""}
+        </div>
+        <SettingsFieldRow label="启用定时刷新" description="关闭时仅保留每天一次的保活刷新" htmlFor="auto-refresh-enabled">
+          <Switch
+            id="auto-refresh-enabled"
+            disabled={!loaded || saving}
+            checked={enabled}
+            onCheckedChange={(v) => void persist(v, hours)}
+          />
+        </SettingsFieldRow>
+        <SettingsFieldRow label="刷新间隔（小时）" description="最小 1 小时，建议 6–24" htmlFor="auto-refresh-hours">
+          <Input
+            id="auto-refresh-hours"
+            type="number"
+            min={1}
+            max={168}
+            className="h-8 w-24 text-xs"
+            disabled={!loaded || saving}
+            value={hours}
+            onChange={(e) => setHours(Math.max(1, Number(e.target.value) || 1))}
+            onBlur={() => void persist(enabled, hours)}
+          />
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
@@ -1388,6 +1736,10 @@ export default function SettingsPage() {
         <AppearanceCard />
         <SupportedToolsCard />
         <AutoCheckinCard />
+        <AutoRefreshCard />
+        {api.isDesktop() ? <DataBackupCard /> : null}
+        {api.isDesktop() ? <ProxyLogSettingsCard /> : null}
+        {api.isDesktop() ? <CloudSyncCard /> : null}
         <RateLimitCard />
         {api.isDesktop() ? <StartupCard /> : null}
         <NotificationHistoryCard />
