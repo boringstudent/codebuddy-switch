@@ -143,6 +143,7 @@ export default function ModelsPage() {
 
   const [accounts, setAccounts] = useState<AccountMeta[]>([]);
   const [testAccountId, setTestAccountId] = useState(() => localStorage.getItem(TEST_ACCOUNT_KEY) ?? "");
+  const [testAccountCredits, setTestAccountCredits] = useState<{ remaining: number; capacity: number } | null>(null);
   const [probes, setProbes] = useState<Record<string, ProbeState>>({});
   const [probingAll, setProbingAll] = useState(false);
 
@@ -204,12 +205,34 @@ export default function ModelsPage() {
 
   // --- 检测与实测 -------------------------------------------------------------
 
+  const refreshTestAccountCredits = useCallback(async (accountId: string) => {
+    try {
+      const r = await api.getCreditExpiry(accountId);
+      if (r.ok && r.totalRemaining != null) {
+        setTestAccountCredits({ remaining: r.totalRemaining, capacity: r.totalCapacity ?? 0 });
+      } else {
+        setTestAccountCredits(null);
+      }
+    } catch {
+      setTestAccountCredits(null);
+    }
+  }, []);
+
   const pickTestAccount = (id: string) => {
     setTestAccountId(id);
     localStorage.setItem(TEST_ACCOUNT_KEY, id);
+    setTestAccountCredits(null);
+    if (id) void refreshTestAccountCredits(id);
   };
 
+  // 持久化的测试账号在挂载时补拉积分。
+  useEffect(() => {
+    if (testAccountId) void refreshTestAccountCredits(testAccountId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const models = catalog?.models ?? [];
+  const testAccount = useMemo(() => accounts.find((a) => a.id === testAccountId) ?? null, [accounts, testAccountId]);
   const filtered = models.filter(
     (m) => !filter || m.id.toLowerCase().includes(filter.toLowerCase()) || (m.name ?? "").toLowerCase().includes(filter.toLowerCase()),
   );
@@ -255,6 +278,7 @@ export default function ModelsPage() {
     } finally {
       setProbingAll(false);
       await reload();
+      if (testAccountId) void refreshTestAccountCredits(testAccountId);
     }
   };
 
@@ -422,6 +446,21 @@ export default function ModelsPage() {
               ))}
             </SelectContent>
           </Select>
+          {testAccount && (
+            <span className="text-sm">
+              账号 <b>{displayName(testAccount)}</b>
+              {testAccountCredits ? (
+                <>
+                  {" "}· 积分剩余 <b>{testAccountCredits.remaining.toLocaleString()}</b>
+                  {testAccountCredits.capacity > 0 && (
+                    <span className="text-muted-foreground"> / {testAccountCredits.capacity.toLocaleString()}</span>
+                  )}
+                </>
+              ) : (
+                <span className="text-muted-foreground"> · 积分查询中…</span>
+              )}
+            </span>
+          )}
           <Button size="sm" variant="outline" onClick={probeAll} disabled={probingAll || !testAccountId}>
             {probingAll ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             检测全部（逐个真实调用）
@@ -544,28 +583,33 @@ export default function ModelsPage() {
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      {probe?.state === "running" && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-                      {probe?.state === "ok" && (
-                        <span className="text-xs text-emerald-600 dark:text-emerald-400" title={probe.note ?? ""}>
-                          可用 · {probe.latency}ms
-                          {probe.creditsPer1m != null && ` · 实测 ¥${(probe.rmbPer1m ?? 0).toFixed(2)}`}
-                        </span>
-                      )}
-                      {probe?.state === "fail" && (
-                        <span className="text-xs text-red-500" title={probe.error}>
-                          不可用{probe.status != null && probe.status > 0 ? ` (${probe.status})` : ""}
-                        </span>
-                      )}
-                      {!probe && (
-                        <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => probeOne(m.id)} disabled={!testAccountId || probingAll}>
-                          检测
+                      <div className="flex max-w-44 flex-col gap-0.5">
+                        {probe?.state === "running" && (
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" /> 检测中…
+                          </span>
+                        )}
+                        {probe?.state === "ok" && (
+                          <span className="text-xs text-emerald-600 dark:text-emerald-400" title={probe.note ?? ""}>
+                            可用 · {probe.latency}ms
+                            {probe.creditsPer1m != null && ` · 实测 ¥${(probe.rmbPer1m ?? 0).toFixed(2)}`}
+                          </span>
+                        )}
+                        {probe?.state === "fail" && (
+                          <span className="truncate text-xs text-red-500" title={probe.error}>
+                            不可用{probe.status != null && probe.status > 0 ? ` (${probe.status})` : ""}
+                          </span>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-fit px-1.5 text-xs"
+                          onClick={() => probeOne(m.id)}
+                          disabled={!testAccountId || probingAll || probe?.state === "running"}
+                        >
+                          {probe ? "重测" : "检测"}
                         </Button>
-                      )}
-                      {probe && probe.state !== "running" && (
-                        <Button size="sm" variant="ghost" className="ml-1 h-7 px-2 text-xs" onClick={() => probeOne(m.id)} disabled={!testAccountId || probingAll}>
-                          重测
-                        </Button>
-                      )}
+                      </div>
                     </td>
                     <td className="px-4 py-2">
                       <div className="flex gap-1">

@@ -3111,7 +3111,6 @@ const QUERY_PAGE_HTML: &str = r##"<!DOCTYPE html>
   .notice { background: #1e293b; border: 1px solid #3b82f6; border-radius: 12px; padding: 12px 14px;
             margin-bottom: 16px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
   .notice b { color: #93c5fd; font-weight: 600; }
-  .qq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #fbbf24; }
   footer { color: #475569; font-size: 12px; text-align: center; margin-top: 24px; }
 </style>
 </head>
@@ -3119,11 +3118,6 @@ const QUERY_PAGE_HTML: &str = r##"<!DOCTYPE html>
 <div class="wrap">
   <h1>Key 余额查询</h1>
   <div class="sub">输入你的 API Key 查询额度、用量与调用日志。Key 只保存在你自己的浏览器里。</div>
-
-  <div class="notice">
-    <span>💡</span>
-    <div>如果需要<b>独享 Key</b>，请找 <span class="qq">1972403603（QQ）</span>。</div>
-  </div>
 
   <div class="card">
     <div class="row">
@@ -3182,7 +3176,6 @@ const QUERY_PAGE_HTML: &str = r##"<!DOCTYPE html>
     <div class="body"><div id="sites"><div class="muted">加载中…</div></div></div>
   </div>
 
-  <footer>如果需要独享 Key，请找 <span class="qq">1972403603（QQ）</span>。</footer>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
