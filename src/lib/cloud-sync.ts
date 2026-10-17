@@ -58,6 +58,23 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    // 浏览器网络层错误（DNS / 连接被拒 / TLS 证书不匹配 / 超时中断）都会抛 TypeError，
+    // 裸文案 "Failed to fetch" 没有排查价值，补上可操作的排查提示。
+    if (error instanceof TypeError || (error instanceof Error && error.name === "AbortError")) {
+      const host = (() => {
+        try {
+          return new URL(url).origin;
+        } catch {
+          return url;
+        }
+      })();
+      throw new Error(
+        `无法连接 ${host}：请检查函数地址是否正确、域名 HTTPS 证书是否有效` +
+          `（浏览器直接打开 ${host}/health 应返回 JSON），以及本机网络是否能访问该域名`,
+      );
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }

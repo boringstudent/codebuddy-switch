@@ -636,6 +636,24 @@ pub fn save_model_catalog_config(config: Value) -> Value {
     wb_switch_core::modules::model_catalog::save_catalog_config(&config)
 }
 
+/// POST /api/model-catalog/upsert —— 手动新增/编辑单个模型条目。
+#[tauri::command]
+pub fn upsert_model_catalog_entry(model: Value) -> Value {
+    wb_switch_core::modules::model_catalog::upsert_model(&model)
+}
+
+/// POST /api/model-catalog/remove —— 删除指定模型条目。
+#[tauri::command]
+pub fn remove_model_catalog_entry(id: String) -> Value {
+    wb_switch_core::modules::model_catalog::remove_model(&id)
+}
+
+/// POST /api/model-catalog/probe —— 用指定账号对模型发真实请求，检测可用性并实测单价（消耗该账号积分）。
+#[tauri::command]
+pub async fn probe_model_catalog_entry(account_id: String, model_id: String) -> Value {
+    wb_switch_core::modules::model_catalog::probe_model(&account_id, &model_id).await
+}
+
 /// 启动当前应用的新进程并退出旧进程，用于更新安装完成后的立即重启。
 #[tauri::command]
 pub fn relaunch_app(_app: tauri::AppHandle) -> Result<(), String> {

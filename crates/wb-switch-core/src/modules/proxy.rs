@@ -2672,6 +2672,9 @@ async fn models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> 
                     "credits_multiplier",
                     "only_reasoning",
                     "max_output_tokens",
+                    "price_credits",
+                    "price_rmb",
+                    "measured",
                 ] {
                     if let Some(v) = cat.get(key) {
                         entry[key] = v.clone();
@@ -2800,7 +2803,8 @@ async fn key_logs_handler(State(state): State<ProxyState>, headers: HeaderMap) -
 ///
 /// 每个模型返回：目录能力参数（上下文 / 思考强度 / Max 模式档位 / 积分倍率）
 /// + 该 Key 自己日志实测聚合的单价（每 1M tokens 积分）与缓存命中率。
-/// 费用与缓存命中率正相关：cached_tokens 占比越高，实测每 1M tokens 积分越低，
+///
+/// 费用与缓存命中率正相关（cached_tokens 占比越高，实测每 1M tokens 积分越低），
 /// 因此同时给出缓存命中率，便于用户解读单价波动。
 async fn models_pricing_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
     let Some(sub_key) = authenticate(&state, &headers) else {
@@ -2886,6 +2890,8 @@ async fn models_pricing_handler(State(state): State<ProxyState>, headers: Header
                     "only_reasoning",
                     "can_disable_thinking",
                     "max_mode",
+                    "price_credits",
+                    "price_rmb",
                     "max_output_tokens",
                     "max_allowed_size",
                     "credits_multiplier",
@@ -2897,6 +2903,11 @@ async fn models_pricing_handler(State(state): State<ProxyState>, headers: Header
                     if let Some(v) = cat.get(key) {
                         entry[key] = v.clone();
                     }
+                }
+                // 目录实测价（模型管理页用管理账号 ping 得到）单独命名为 catalog_measured，
+                // 避免与下面「该 Key 自己的用量聚合」的 measured 字段冲突——后者优先。
+                if let Some(v) = cat.get("measured") {
+                    entry["catalog_measured"] = v.clone();
                 }
             }
             if entry.get("context_length").is_none() {
@@ -2983,10 +2994,11 @@ pub fn save_sites(sites: &Value) -> Result<Value, String> {
     Ok(json!({"sites": cleaned}))
 }
 
+type SiteStatusCache = Option<(Vec<Value>, std::time::Instant)>;
+
 /// 站点探测结果缓存：60 秒内重复查询直接复用，避免每个访客都触发一轮外网探测。
-fn site_status_cache() -> &'static std::sync::Mutex<Option<(Vec<Value>, std::time::Instant)>> {
-    static CACHE: OnceLock<std::sync::Mutex<Option<(Vec<Value>, std::time::Instant)>>> =
-        OnceLock::new();
+fn site_status_cache() -> &'static std::sync::Mutex<SiteStatusCache> {
+    static CACHE: OnceLock<std::sync::Mutex<SiteStatusCache>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -3141,6 +3153,17 @@ const QUERY_PAGE_HTML: &str = r##"<!DOCTYPE html>
         </table></div>
         <div class="muted" id="pricing-note" style="margin-top:8px"></div>
         <div class="muted" id="upstream-params" style="margin-top:4px"></div>
+        <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+          <span class="muted">换算</span>
+          <select id="conv-model" style="max-width:220px"></select>
+          <select id="conv-kind">
+            <option value="rmb">人民币 ¥</option>
+            <option value="credits">积分</option>
+            <option value="tokens">Tokens</option>
+          </select>
+          <input id="conv-val" type="number" value="10" min="0" step="any" style="width:110px">
+          <span id="conv-out" class="muted"></span>
+        </div>
       </div>
     </div>
     <div class="card collapsed" id="card-logs" data-card="logs">
@@ -3265,8 +3288,13 @@ function fmtCtx(n) {
   return String(n);
 }
 
+let _pricingModels = [];
+let _creditsPerYuan = 400;
+
 function renderPricing(pricing) {
   const models = pricing && pricing.models || [];
+  _pricingModels = models;
+  _creditsPerYuan = (pricing && pricing.credits_per_yuan) || 400;
   if (!models.length) {
     $("models").innerHTML = '<tr><td colspan="7" class="muted">暂无模型数据</td></tr>';
     $("pricing-note").textContent = "";
@@ -3282,8 +3310,16 @@ function renderPricing(pricing) {
     let price = "暂无用量";
     let cache = "—";
     if (m.measured) {
+      // 该 Key 自己的用量聚合（最贴近实际使用）。
       price = m.measured.credits_per_1m + " 积分（≈¥" + m.measured.credits_yuan_per_1m + "）";
       cache = (m.measured.cache_hit_rate * 100).toFixed(1) + "%";
+    } else if (m.catalog_measured && m.catalog_measured.credits_per_1m != null) {
+      // 目录实测价（模型管理页 ping 实测写回）。
+      price = m.catalog_measured.credits_per_1m + " 积分（≈¥" + m.catalog_measured.rmb_per_1m + "）· 目录实测";
+    } else if (m.price_credits != null || m.price_rmb != null) {
+      const c = m.price_credits != null ? m.price_credits + " 积分" : "";
+      const r = m.price_rmb != null ? "¥" + m.price_rmb : "";
+      price = [c, r].filter(Boolean).join("（") + (c && r ? "）" : "");
     }
     return `<tr><td>${m.name || m.id}<div class="muted">${m.id}</div></td>` +
       `<td>${fmtCtx(m.context_length)}</td><td>${efforts}</td><td>${maxMode}</td>` +
@@ -3293,7 +3329,45 @@ function renderPricing(pricing) {
   const up = pricing.upstream_params || {};
   const parts = Object.keys(up).map((k) => k + "：" + up[k]);
   $("upstream-params").textContent = parts.length ? "上游参数——" + parts.join("；") : "";
+  // 填充换算器模型下拉
+  const sel = $("conv-model");
+  const prev = sel.value;
+  sel.innerHTML = models.map((m) => `<option value="${m.id}">${m.name || m.id}</option>`).join("");
+  if (prev && models.some((m) => m.id === prev)) sel.value = prev;
+  updateConverter();
 }
+
+/** 该模型每 1M tokens 积分单价：该 Key 实测 > 目录实测 > 手动填写。 */
+function creditsPer1mOf(m) {
+  if (m.measured && m.measured.credits_per_1m != null) return m.measured.credits_per_1m;
+  if (m.catalog_measured && m.catalog_measured.credits_per_1m != null) return m.catalog_measured.credits_per_1m;
+  if (m.price_credits != null) return m.price_credits;
+  if (m.price_rmb != null) return m.price_rmb * _creditsPerYuan;
+  return null;
+}
+
+function updateConverter() {
+  const m = _pricingModels.find((x) => x.id === $("conv-model").value);
+  const out = $("conv-out");
+  if (!m) { out.textContent = ""; return; }
+  const c1m = creditsPer1mOf(m);
+  if (c1m == null) { out.textContent = "该模型暂无单价"; return; }
+  const v = parseFloat($("conv-val").value);
+  if (!isFinite(v) || v < 0) { out.textContent = ""; return; }
+  const kind = $("conv-kind").value;
+  let rmb, credits, tokens;
+  if (kind === "rmb") { rmb = v; credits = v * _creditsPerYuan; tokens = c1m > 0 ? credits / c1m * 1e6 : null; }
+  else if (kind === "credits") { credits = v; rmb = v / _creditsPerYuan; tokens = c1m > 0 ? v / c1m * 1e6 : null; }
+  else { tokens = v; credits = v / 1e6 * c1m; rmb = credits / _creditsPerYuan; }
+  const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : Math.round(n);
+  out.innerHTML = "= <b>¥" + rmb.toFixed(2) + "</b> · <b>" +
+    credits.toLocaleString(undefined, { maximumFractionDigits: 1 }) + "</b> 积分" +
+    (tokens != null ? " · 约 <b>" + fmtTok(tokens) + "</b> tokens" : "");
+}
+
+$("conv-model").onchange = updateConverter;
+$("conv-kind").onchange = updateConverter;
+$("conv-val").oninput = updateConverter;
 
 async function loadSites() {
   try {

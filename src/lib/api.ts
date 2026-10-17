@@ -405,6 +405,19 @@ export interface CatalogModel {
   /** 积分倍率（服务器 credits "x0.79" 解析值）。 */
   credits_multiplier?: number;
   max_output_tokens?: number;
+  /** 手动设置：每 1M tokens 积分单价。 */
+  price_credits?: number;
+  /** 手动设置：每 1M tokens 人民币单价。 */
+  price_rmb?: number;
+  /** 实测单价记录（probe 回写）。 */
+  measured?: {
+    credits_per_1m?: number;
+    rmb_per_1m?: number;
+    credits?: number;
+    total_tokens?: number;
+    at?: number;
+    by?: string;
+  };
   /** 官方返回原文，未识别字段都在这里。 */
   raw?: Record<string, unknown>;
 }
@@ -450,6 +463,53 @@ export function saveModelCatalogConfig(config: {
   return call("save_model_catalog_config", {
     config: config as unknown as Record<string, unknown>,
   });
+}
+
+/** 手动新增/编辑单个模型条目；返回 `{ok, error?, catalog?}`。 */
+export function upsertModelCatalogEntry(model: {
+  id: string;
+  name?: string | null;
+  context_length?: number | null;
+  thinking_levels?: string[] | null;
+  default_effort?: string | null;
+  max_mode?: boolean | null;
+  credits_multiplier?: number | null;
+  price_credits?: number | null;
+  price_rmb?: number | null;
+}): Promise<{ ok: boolean; error?: string; catalog?: ModelCatalog }> {
+  return call("upsert_model_catalog_entry", {
+    model: model as unknown as Record<string, unknown>,
+  });
+}
+
+/** 删除指定模型条目。 */
+export function removeModelCatalogEntry(
+  id: string,
+): Promise<{ ok: boolean; error?: string; catalog?: ModelCatalog }> {
+  return call("remove_model_catalog_entry", { id });
+}
+
+/** 用指定账号对模型发真实请求：检测可用性并实测单价（消耗该账号少量积分）。 */
+export function probeModelCatalogEntry(
+  accountId: string,
+  modelId: string,
+): Promise<{
+  ok: boolean;
+  status?: number;
+  latency_ms?: number;
+  error?: string;
+  note?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cached_tokens?: number;
+    total_tokens?: number;
+    credits?: number;
+  };
+  credits_per_1m?: number;
+  rmb_per_1m?: number;
+}> {
+  return call("probe_model_catalog_entry", { accountId, modelId });
 }
 
 /** 定时刷新配置：`{enabled, interval_hours, last_run_at?}`。 */

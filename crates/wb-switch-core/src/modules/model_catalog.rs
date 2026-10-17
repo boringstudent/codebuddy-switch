@@ -379,27 +379,31 @@ pub fn refresh_catalog_from_client_cache() -> Value {
                 continue;
             };
             let id = model["id"].as_str().unwrap_or("").to_string();
-            if !merged.contains_key(&id) {
-                order.push(id.clone());
-                merged.insert(id, model);
-                continue;
-            }
-            // 同 id 覆盖策略：字段丰富度更高的优先（新文件的条目字段可能更稀疏，
-            // 如新版缓存里 contextWindow 为 null，不能让旧文件的档位信息被冲掉）。
-            let richness = |m: &Value| {
-                [
-                    "thinking_levels",
-                    "credits_multiplier",
-                    "context_lengths",
-                    "max_mode",
-                    "context_length",
-                ]
-                .iter()
-                .filter(|k| m.get(**k).is_some())
-                .count()
-            };
-            if richness(&model) >= richness(&merged[&id]) {
-                merged.insert(id, model);
+            match merged.entry(id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    order.push(slot.key().clone());
+                    slot.insert(model);
+                    continue;
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    // 同 id 覆盖策略：字段丰富度更高的优先（新文件的条目字段可能更稀疏，
+                    // 如新版缓存里 contextWindow 为 null，不能让旧文件的档位信息被冲掉）。
+                    let richness = |m: &Value| {
+                        [
+                            "thinking_levels",
+                            "credits_multiplier",
+                            "context_lengths",
+                            "max_mode",
+                            "context_length",
+                        ]
+                        .iter()
+                        .filter(|k| m.get(**k).is_some())
+                        .count()
+                    };
+                    if richness(&model) >= richness(slot.get()) {
+                        slot.insert(model);
+                    }
+                }
             }
         }
     }
@@ -486,6 +490,200 @@ pub fn upstream_params_doc() -> Value {
         "isThinking": "布尔：是否开启思考模式（only_reasoning 模型恒为开启）",
         "contextWindowTokens": "数字：上下文窗口大小；Max 模式 = 取该模型 context_lengths 的最大档位",
     })
+}
+
+// ---------------------------------------------------------------------------
+// 手动编辑与实测探测
+// ---------------------------------------------------------------------------
+
+/// 积分 ↔ 人民币换算基准（与代理 /v1/models/pricing 的定价口径一致）。
+pub const CREDITS_PER_YUAN: f64 = 400.0;
+
+/// 手动新增/编辑单个模型条目（模型管理页保存行）。
+///
+/// 输入字段：`id`（必填）；`name` / `context_length` / `thinking_levels` /
+/// `default_effort` / `max_mode` / `credits_multiplier` / `price_credits` /
+/// `price_rmb` 传 null 表示清除该字段。保留原条目的 `raw` 原文与实测记录。
+pub fn upsert_model(input: &Value) -> Value {
+    let Some(id) = input
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return json!({"ok": false, "error": "缺少模型 id"});
+    };
+    let mut cat = load_catalog();
+    let models = cat["models"].as_array_mut().expect("models 已保证为数组");
+    let existing = models
+        .iter()
+        .position(|m| m.get("id").and_then(Value::as_str) == Some(id));
+    let mut entry = match existing {
+        Some(idx) => models[idx].clone(),
+        None => json!({"id": id}),
+    };
+    entry["id"] = json!(id);
+    // 可编辑字段：null = 删除，其余直接覆盖。
+    for key in [
+        "name",
+        "context_length",
+        "thinking_levels",
+        "default_effort",
+        "max_mode",
+        "credits_multiplier",
+        "price_credits",
+        "price_rmb",
+    ] {
+        if let Some(v) = input.get(key) {
+            if v.is_null() {
+                entry.as_object_mut().unwrap().remove(key);
+            } else {
+                entry[key] = v.clone();
+            }
+        }
+    }
+    match existing {
+        Some(idx) => models[idx] = entry,
+        None => models.push(entry),
+    }
+    cat["updated_at"] = json!(now_ms());
+    cat["source"] = json!("manual-edit");
+    save_catalog(&cat);
+    json!({"ok": true, "catalog": cat})
+}
+
+/// 删除指定模型条目。
+pub fn remove_model(id: &str) -> Value {
+    let id = id.trim();
+    if id.is_empty() {
+        return json!({"ok": false, "error": "缺少模型 id"});
+    }
+    let mut cat = load_catalog();
+    let models = cat["models"].as_array_mut().expect("models 已保证为数组");
+    let before = models.len();
+    models.retain(|m| m.get("id").and_then(Value::as_str) != Some(id));
+    if models.len() == before {
+        return json!({"ok": false, "error": format!("目录中没有模型 {id}")});
+    }
+    save_catalog(&cat);
+    json!({"ok": true, "catalog": cat})
+}
+
+/// 用指定账号对指定模型发一次真实请求，探测可用性并实测单价。
+///
+/// 请求体为 1-token ping（`max_tokens: 1`），消耗极小但仍会计费——
+/// 这正是目的：从响应 `usage` 里的真实扣费算出「每 1M tokens 积分/人民币」，
+/// 并回写目录条目的 `measured` 字段（含测量时间与所用账号）。
+///
+/// 返回：`{ok, status, latency_ms, error?, usage?, credits_per_1m?, rmb_per_1m?}`。
+pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return json!({"ok": false, "error": "缺少模型 id"});
+    }
+    let Some(acc) = account::find_account(account_id) else {
+        return json!({"ok": false, "error": format!("未找到账号 {account_id}")});
+    };
+    if let Some(err) = account::envelope_token_error(&acc) {
+        return json!({"ok": false, "error": err});
+    }
+    // 临期 token 先刷新，避免探测因 401 误报不可用。
+    let cfg = crate::modules::config::load_checkin_config();
+    let acc = crate::modules::refresh::ensure_fresh_token(acc, &cfg).await;
+    let headers = account::build_auth_headers(&acc);
+    let url = format!(
+        "{}/chat/completions",
+        crate::modules::proxy::DEFAULT_UPSTREAM
+    );
+    let body = json!({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let started = std::time::Instant::now();
+    let resp = http_request(&url, "POST", Some(body), Some(&headers)).await;
+    let latency_ms = started.elapsed().as_millis() as i64;
+
+    let usage = resp.get("usage").filter(|v| v.is_object());
+    if usage.is_none() {
+        let status = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let message = resp
+            .pointer("/error/message")
+            .or_else(|| resp.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("无 usage 返回")
+            .to_string();
+        return json!({
+            "ok": false,
+            "status": status,
+            "latency_ms": latency_ms,
+            "error": message,
+        });
+    }
+    let usage = usage.unwrap();
+    let credits = usage.get("credits").and_then(Value::as_f64).unwrap_or(0.0);
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = usage
+        .get("cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // 单次 ping 的 token 数太小（个位数），除法放大误差极大：单价以「消耗积分 ÷
+    // 总 tokens × 100 万」计算，credits 为 0（免费/未计费）时不写实测价。
+    let mut result = json!({
+        "ok": true,
+        "status": 200,
+        "latency_ms": latency_ms,
+        "usage": {
+            "input_tokens": input,
+            "output_tokens": output,
+            "cached_tokens": cached,
+            "total_tokens": total,
+            "credits": credits,
+        },
+    });
+    if credits > 0.0 && total > 0 {
+        let credits_per_1m = credits * 1e7 / total as f64;
+        let rmb_per_1m = credits_per_1m / CREDITS_PER_YUAN;
+        result["credits_per_1m"] = json!((credits_per_1m * 100.0).round() / 100.0);
+        result["rmb_per_1m"] = json!((rmb_per_1m * 100.0).round() / 100.0);
+        // 回写目录条目实测价（供价格表与换算器使用）。
+        if let Some(mut entry) = catalog_model(model_id) {
+            entry["measured"] = json!({
+                "credits_per_1m": result["credits_per_1m"],
+                "rmb_per_1m": result["rmb_per_1m"],
+                "credits": credits,
+                "total_tokens": total,
+                "at": now_ms(),
+                "by": account::account_display_name(&acc),
+            });
+            let mut cat = load_catalog();
+            if let Some(models) = cat["models"].as_array_mut() {
+                if let Some(slot) = models
+                    .iter_mut()
+                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
+                {
+                    *slot = entry;
+                    save_catalog(&cat);
+                }
+            }
+        }
+    } else {
+        result["note"] = json!("该请求未计费（credits=0），未写入实测单价");
+    }
+    result
 }
 
 #[cfg(test)]

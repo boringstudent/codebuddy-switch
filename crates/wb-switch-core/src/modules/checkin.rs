@@ -33,8 +33,8 @@ use crate::modules::account::{
     account_display_name, build_auth_headers, envelope_token_error, load_accounts, variant_of,
 };
 use crate::modules::config::{
-    add_checkin_log, default_checkin_config, http_request, is_route_missing, load_checkin_config,
-    load_checkin_logs, now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
+    add_checkin_log, http_request, is_route_missing, load_checkin_config, load_checkin_logs,
+    now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
@@ -1422,7 +1422,8 @@ mod tests {
     /// 即每日 00:10 触发（不随账号/日期漂移）。
     #[test]
     fn default_window_triggers_every_account_at_00_10() {
-        let win = window_minutes(&default_checkin_config()).expect("默认窗口必须生效");
+        let win = window_minutes(&crate::modules::config::default_checkin_config())
+            .expect("默认窗口必须生效");
         assert_eq!(win, (10, 11));
         for account in [
             json!({"id": "a"}),
