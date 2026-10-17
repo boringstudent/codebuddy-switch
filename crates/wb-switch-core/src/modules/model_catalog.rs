@@ -595,50 +595,67 @@ pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
         "{}/chat/completions",
         crate::modules::proxy::DEFAULT_UPSTREAM
     );
+    // 探测请求必须与代理转发口径一致（见 chat_completions_handler）：
+    // 上游只支持流式（强制 stream=true + include_usage，usage 在最后一个 SSE chunk），
+    // 且要求至少 2 条 message——非流式单消息会被上游统一拒绝（业务码 11101）。
     let body = json!({
         "model": model_id,
-        "messages": [{"role": "user", "content": "ping"}],
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "ping"},
+        ],
         "max_tokens": 1,
-        "stream": false,
+        "stream": true,
+        "stream_options": {"include_usage": true},
     });
     let started = std::time::Instant::now();
-    let resp = http_request(&url, "POST", Some(body), Some(&headers)).await;
+    let mut req = crate::modules::config::http_client().post(&url);
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    let resp = match req
+        .header("Accept", "text/event-stream")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "status": -1,
+                "latency_ms": started.elapsed().as_millis() as i64,
+                "error": format!("请求失败: {e}"),
+            });
+        }
+    };
+    let http_status = resp.status().as_u16() as i64;
+    // 读流：UsageScan 提取末尾 usage；原文保留（上限 256KB）用于错误解析。
+    let mut scan = crate::modules::proxy::UsageScan::new();
+    let mut raw = String::new();
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        let text = String::from_utf8_lossy(&bytes);
+        scan.feed(&text);
+        if raw.len() < 262_144 {
+            raw.push_str(&text);
+        }
+    }
     let latency_ms = started.elapsed().as_millis() as i64;
 
-    let usage = resp.get("usage").filter(|v| v.is_object());
-    if usage.is_none() {
-        let status = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
-        let message = resp
-            .pointer("/error/message")
-            .or_else(|| resp.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("无 usage 返回")
-            .to_string();
+    if scan.usage.is_null() {
+        // 无 usage：从错误响应里提取业务码与消息（普通 JSON 或 SSE error 行）。
+        let (code, message) = probe_error_from_text(&raw, http_status);
         return json!({
             "ok": false,
-            "status": status,
+            "status": code,
             "latency_ms": latency_ms,
             "error": message,
         });
     }
-    let usage = usage.unwrap();
-    let credits = usage.get("credits").and_then(Value::as_f64).unwrap_or(0.0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let input = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .get("cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let (input, output, total, cached, credits) = crate::modules::proxy::usage_numbers(&scan.usage);
 
     // 单次 ping 的 token 数太小（个位数），除法放大误差极大：单价以「消耗积分 ÷
     // 总 tokens × 100 万」计算，credits 为 0（免费/未计费）时不写实测价。
@@ -686,9 +703,73 @@ pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
     result
 }
 
+/// 从无 usage 的探测响应文本中提取业务错误码与消息。
+/// 兼容普通 JSON 错误体（`{"code":11101,"message":...}` / `{"error":{"message":...}}`）
+/// 与 SSE 错误行（`data: {...}`）。
+fn probe_error_from_text(raw: &str, http_status: i64) -> (i64, String) {
+    let extract = |v: &Value| -> Option<(i64, String)> {
+        let message = v
+            .pointer("/error/message")
+            .or_else(|| v.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)?;
+        let code = v
+            .get("code")
+            .and_then(Value::as_i64)
+            .filter(|c| *c != 0)
+            .unwrap_or(http_status);
+        Some((code, message))
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        if let Some(r) = extract(&v) {
+            return r;
+        }
+    }
+    for line in raw.lines() {
+        let Some(data) = line.trim().strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(data) {
+            let is_error = v.get("error").is_some()
+                || v.get("code")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|c| c != 0);
+            if is_error {
+                if let Some(r) = extract(&v) {
+                    return r;
+                }
+            }
+        }
+    }
+    let snippet: String = raw.trim().chars().take(120).collect();
+    let message = if snippet.is_empty() {
+        "无 usage 返回".to_string()
+    } else {
+        snippet
+    };
+    (http_status, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_error_parses_json_and_sse_shapes() {
+        let (code, msg) =
+            probe_error_from_text(r#"{"code":11101,"message":"invalid request"}"#, 200);
+        assert_eq!((code, msg.as_str()), (11101, "invalid request"));
+        let (code, msg) = probe_error_from_text(
+            "data: {\"choices\":[]}\n\ndata: {\"error\":{\"message\":\"model denied\"}}\n\ndata: [DONE]\n",
+            200,
+        );
+        assert_eq!((code, msg.as_str()), (200, "model denied"));
+        let (code, msg) = probe_error_from_text("", 503);
+        assert_eq!((code, msg.as_str()), (503, "无 usage 返回"));
+    }
 
     #[test]
     fn extract_models_supports_common_shapes() {

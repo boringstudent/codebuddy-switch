@@ -1032,7 +1032,7 @@ fn json_f64(value: Option<&Value>) -> Option<f64> {
 ///
 /// 全部字段容忍数字字符串；`total_tokens` 缺失 / 为 0 时用 prompt + completion 兜底，
 /// 否则子 Key 的 Token 上限会随「没记上」而永不触发。
-fn usage_numbers(usage: &Value) -> (u64, u64, u64, u64, f64) {
+pub(crate) fn usage_numbers(usage: &Value) -> (u64, u64, u64, u64, f64) {
     let prompt = json_u64(usage.get("prompt_tokens")).unwrap_or(0);
     let completion = json_u64(usage.get("completion_tokens")).unwrap_or(0);
     let total = json_u64(usage.get("total_tokens"))
@@ -3412,14 +3412,14 @@ async fn options_handler() -> Response {
         .unwrap()
 }
 
-struct UsageScan {
+pub(crate) struct UsageScan {
     /// 跨 chunk 残留的未解析文本（data 行可能被 TCP 分包截断）。
     tail: String,
-    usage: Value,
+    pub(crate) usage: Value,
 }
 
 impl UsageScan {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tail: String::new(),
             usage: Value::Null,
@@ -3428,7 +3428,7 @@ impl UsageScan {
 
     /// 扫描 SSE chunk，捕获最后一个带 prompt_tokens 的 usage 对象。
     /// 未完整的最后一行留在 tail，等后续 chunk 拼接（TCP 分包可能截断 data 行）。
-    fn feed(&mut self, chunk: &str) {
+    pub(crate) fn feed(&mut self, chunk: &str) {
         self.tail.push_str(chunk);
         while let Some(pos) = self.tail.find('\n') {
             let line: String = self.tail.drain(..=pos).collect();

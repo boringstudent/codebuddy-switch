@@ -1000,7 +1000,7 @@ fn http_client_builder() -> reqwest::ClientBuilder {
         .user_agent(DEFAULT_HTTP_USER_AGENT)
 }
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         http_client_builder()
             .build()
