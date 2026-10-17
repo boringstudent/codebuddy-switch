@@ -658,7 +658,8 @@ pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
     let (input, output, total, cached, credits) = crate::modules::proxy::usage_numbers(&scan.usage);
 
     // 单次 ping 的 token 数太小（个位数），除法放大误差极大：单价以「消耗积分 ÷
-    // 总 tokens × 100 万」计算，credits 为 0（免费/未计费）时不写实测价。
+    // 总 tokens × 100 万」计算。credits 为 0（免费/未计费）时也按 0 写回实测价，
+    // 保证每个可用模型都有单价（显示为免费），不再是空缺的「—」。
     let mut result = json!({
         "ok": true,
         "status": 200,
@@ -671,8 +672,8 @@ pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
             "credits": credits,
         },
     });
-    if credits > 0.0 && total > 0 {
-        let credits_per_1m = credits * 1e7 / total as f64;
+    if total > 0 {
+        let credits_per_1m = credits * 1e6 / total as f64;
         let rmb_per_1m = credits_per_1m / CREDITS_PER_YUAN;
         result["credits_per_1m"] = json!((credits_per_1m * 100.0).round() / 100.0);
         result["rmb_per_1m"] = json!((rmb_per_1m * 100.0).round() / 100.0);
@@ -697,8 +698,11 @@ pub async fn probe_model(account_id: &str, model_id: &str) -> Value {
                 }
             }
         }
+        if credits == 0.0 {
+            result["note"] = json!("本次请求未计费，已按免费（¥0/1M tokens）写入实测价");
+        }
     } else {
-        result["note"] = json!("该请求未计费（credits=0），未写入实测单价");
+        result["note"] = json!("响应未返回 token 用量，无法计算单价");
     }
     result
 }

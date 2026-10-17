@@ -49,6 +49,9 @@ const CONTEXT_LABELS: Record<number, string> = { 64000: "64K", 200000: "200K", 2
 /** 积分 ↔ 人民币换算基准（与后端 /v1/models/pricing 口径一致）。 */
 const CREDITS_PER_YUAN = 400;
 
+/** 换算器假设：缓存命中的 tokens 按 0.1 倍计费（上游未公布缓存折价，命中越多越省）。 */
+const CACHE_BILL_RATE = 0.1;
+
 const TEST_ACCOUNT_KEY = "wb_models_test_account";
 
 function num(v: unknown): number | null {
@@ -151,10 +154,13 @@ export default function ModelsPage() {
   const [editForm, setEditForm] = useState<EditForm>(formFromModel(null));
   const [savingEdit, setSavingEdit] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CatalogModel | null>(null);
+  const [confirmDeleteFailed, setConfirmDeleteFailed] = useState(false);
+  const [deletingFailed, setDeletingFailed] = useState(false);
 
   const [convModelId, setConvModelId] = useState("");
   const [convKind, setConvKind] = useState<"rmb" | "credits" | "tokens">("rmb");
   const [convValue, setConvValue] = useState("10");
+  const [convHit, setConvHit] = useState("0");
 
   const reload = useCallback(async () => {
     try {
@@ -341,6 +347,39 @@ export default function ModelsPage() {
     }
   };
 
+  // 检测失败的模型 id 列表（用于一键删除不可用模型）。
+  const failedIds = useMemo(
+    () => Object.entries(probes).filter(([, p]) => p.state === "fail").map(([id]) => id),
+    [probes],
+  );
+
+  const deleteFailed = async () => {
+    setConfirmDeleteFailed(false);
+    setDeletingFailed(true);
+    let removed = 0;
+    try {
+      for (const id of failedIds) {
+        try {
+          const res = await api.removeModelCatalogEntry(id);
+          if (res.ok && res.catalog) {
+            setCatalog(res.catalog);
+            removed += 1;
+          }
+        } catch {
+          // 单个失败不中断批量删除
+        }
+      }
+      setProbes((s) => {
+        const next = { ...s };
+        for (const id of failedIds) delete next[id];
+        return next;
+      });
+      toast.success(`已删除 ${removed}/${failedIds.length} 个不可用模型`);
+    } finally {
+      setDeletingFailed(false);
+    }
+  };
+
   const doDelete = async () => {
     if (!deleteTarget) return;
     try {
@@ -363,21 +402,27 @@ export default function ModelsPage() {
   const convModel = useMemo(() => models.find((m) => m.id === convModelId) ?? null, [models, convModelId]);
   const convPrice = convModel ? priceOf(convModel) : null;
 
+  // 缓存命中率：命中部分按 CACHE_BILL_RATE 折算计费（未命中部分全价）。
+  const convHitPct = Math.min(100, Math.max(0, Number(convHit) || 0));
+  const billFactor = 1 - (convHitPct / 100) * (1 - CACHE_BILL_RATE);
+
   const conversion = useMemo(() => {
     if (!convPrice || convPrice.credits1m == null || convPrice.rmb1m == null) return null;
+    if (convPrice.credits1m === 0) return { free: true as const };
     const v = Number(convValue);
     if (!Number.isFinite(v) || v < 0) return null;
-    const { credits1m } = convPrice;
-    if (convKind === "rmb") {
-      const credits = v * CREDITS_PER_YUAN;
-      return { rmb: v, credits, tokens: credits1m > 0 ? (credits / credits1m) * 1_000_000 : null };
+    const c1m = convPrice.credits1m;
+    // 计费链：总 tokens × billFactor = 计费 tokens → /1M × 单价 = 积分 → /400 = 人民币。
+    if (convKind === "tokens") {
+      const billed = v * billFactor;
+      const credits = (billed / 1_000_000) * c1m;
+      return { tokens: v, billed, credits, rmb: credits / CREDITS_PER_YUAN };
     }
-    if (convKind === "credits") {
-      return { rmb: v / CREDITS_PER_YUAN, credits: v, tokens: credits1m > 0 ? (v / credits1m) * 1_000_000 : null };
-    }
-    const credits = (v / 1_000_000) * credits1m;
-    return { rmb: credits / CREDITS_PER_YUAN, credits, tokens: v };
-  }, [convPrice, convKind, convValue]);
+    const credits = convKind === "rmb" ? v * CREDITS_PER_YUAN : v;
+    const billed = (credits / c1m) * 1_000_000;
+    const tokens = billFactor > 0 ? billed / billFactor : null;
+    return { tokens, billed, credits, rmb: credits / CREDITS_PER_YUAN };
+  }, [convPrice, convKind, convValue, billFactor]);
 
   const fmtTokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(Math.round(n)));
 
@@ -465,7 +510,18 @@ export default function ModelsPage() {
             {probingAll ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             检测全部（逐个真实调用）
           </Button>
-          <span className="text-xs text-muted-foreground">每个模型发一条 1-token 请求；计费模型的实测单价（每 1M tokens）自动写回价格表</span>
+          {failedIds.length > 0 && (
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() => setConfirmDeleteFailed(true)}
+              disabled={deletingFailed || probingAll}
+            >
+              {deletingFailed ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+              删除不可用模型（{failedIds.length}）
+            </Button>
+          )}
+          <span className="text-xs text-muted-foreground">每个模型发一条 1-token 请求；实测单价（每 1M tokens）自动写回价格表，免费模型记为 ¥0</span>
         </CardContent>
       </Card>
 
@@ -496,18 +552,29 @@ export default function ModelsPage() {
             </SelectContent>
           </Select>
           <Input className="w-32" value={convValue} onChange={(e) => setConvValue(e.target.value)} />
+          <label className="flex items-center gap-1 text-sm text-muted-foreground">
+            缓存命中率
+            <Input className="w-20" value={convHit} onChange={(e) => setConvHit(e.target.value)} />%
+          </label>
           {convModel && !conversion && (
-            <span className="text-xs text-muted-foreground">该模型暂无单价，请先实测或在编辑中填写</span>
+            <span className="text-xs text-muted-foreground">该模型暂无单价，请先检测实测或在编辑中填写</span>
           )}
-          {conversion && (
+          {conversion && "free" in conversion && (
+            <span className="text-sm">
+              该模型<b>免费</b>（实测 ¥0/1M tokens），不消耗积分
+            </span>
+          )}
+          {conversion && !("free" in conversion) && (
             <span className="text-sm">
               = <b>¥{conversion.rmb.toFixed(2)}</b> · <b>{conversion.credits.toLocaleString(undefined, { maximumFractionDigits: 1 })}</b> 积分
-              {conversion.tokens != null && (
-                <>
-                  {" "}· 约 <b>{fmtTokens(conversion.tokens)}</b> tokens
-                </>
+              {" "}· 计费 <b>{fmtTokens(conversion.billed)}</b> tokens
+              {conversion.tokens != null && convHitPct > 0 && (
+                <span className="text-muted-foreground">（总 {fmtTokens(conversion.tokens)}）</span>
               )}
             </span>
+          )}
+          {convHitPct > 0 && (
+            <span className="text-xs text-muted-foreground">命中部分按 {CACHE_BILL_RATE} 倍计费</span>
           )}
         </CardContent>
       </Card>
@@ -519,7 +586,8 @@ export default function ModelsPage() {
 
       <Card>
         <div className="max-h-[60vh] overflow-auto">
-          <table className="w-full text-sm">
+          {/* min-w 保证列不被挤压重叠：窗口过窄时横向滚动而不是挤作一团 */}
+          <table className="w-full min-w-[1120px] text-sm">
             <thead className="sticky top-0 bg-card">
               <tr className="border-b text-left text-muted-foreground">
                 <th className="px-4 py-2 font-medium">模型</th>
@@ -573,13 +641,20 @@ export default function ModelsPage() {
                     <td className="px-4 py-2 tabular-nums">{m.credits_multiplier != null ? `x${m.credits_multiplier}` : "—"}</td>
                     <td className="px-4 py-2 tabular-nums">
                       {price.rmb1m != null ? (
-                        <span title={price.measured && m.measured ? `实测于 ${m.measured.at ? new Date(m.measured.at).toLocaleString("zh-CN") : "—"}${m.measured.by ? ` · 账号 ${m.measured.by}` : ""}` : "手动填写"}>
-                          ¥{price.rmb1m.toFixed(2)}
-                          {price.credits1m != null && <span className="text-xs text-muted-foreground">（{price.credits1m.toLocaleString()} 积分）</span>}
-                          {price.measured && <Badge variant="outline" className="ml-1">实测</Badge>}
-                        </span>
+                        price.rmb1m === 0 ? (
+                          <span title={price.measured && m.measured ? `实测免费 · ${m.measured.at ? new Date(m.measured.at).toLocaleString("zh-CN") : ""}${m.measured.by ? ` · 账号 ${m.measured.by}` : ""}` : "手动填写为 0"}>
+                            <Badge variant="secondary">免费</Badge>
+                            {price.measured && <Badge variant="outline" className="ml-1">实测</Badge>}
+                          </span>
+                        ) : (
+                          <span title={price.measured && m.measured ? `实测于 ${m.measured.at ? new Date(m.measured.at).toLocaleString("zh-CN") : "—"}${m.measured.by ? ` · 账号 ${m.measured.by}` : ""}` : "手动填写"}>
+                            ¥{price.rmb1m.toFixed(2)}
+                            {price.credits1m != null && <span className="text-xs text-muted-foreground">（{price.credits1m.toLocaleString()} 积分）</span>}
+                            {price.measured && <Badge variant="outline" className="ml-1">实测</Badge>}
+                          </span>
+                        )
                       ) : (
-                        <span className="text-muted-foreground">—</span>
+                        <span className="text-xs text-muted-foreground">未实测（点「检测」获取）</span>
                       )}
                     </td>
                     <td className="px-4 py-2">
@@ -714,6 +789,28 @@ export default function ModelsPage() {
             </Button>
             <Button variant="destructive" onClick={doDelete}>
               删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmDeleteFailed} onOpenChange={setConfirmDeleteFailed}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>删除不可用模型</DialogTitle>
+            <DialogDescription>
+              以下 {failedIds.length} 个模型检测不可用，删除后代理不再下发。此操作不可撤销。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-48 overflow-auto rounded bg-muted p-3 text-xs">
+            {failedIds.join("、")}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDeleteFailed(false)}>
+              取消
+            </Button>
+            <Button variant="destructive" onClick={deleteFailed}>
+              全部删除
             </Button>
           </DialogFooter>
         </DialogContent>
