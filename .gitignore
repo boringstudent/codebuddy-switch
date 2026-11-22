@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dist-android/
 public/companion/
 public/companion-demo/
 src-tauri/binaries/agent-studio-runtime-*
@@ -21,6 +22,10 @@ src-tauri/target/
 
 # 本地运行时数据
 accounts.json
+# 各平台账号导出（含 token，绝不提交）
+workbuddy-accounts.json
+trae-accounts.json
+qoder-accounts.json
 backups/
 
 # 本地素材与浏览器调试残留

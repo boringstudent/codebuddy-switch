@@ -1,7 +1,7 @@
-// 本地冒烟测试：edge/eo-account-store.js（GitHub 持久化版 EO 函数）
+// 本地冒烟测试：edge/eo-account-store.js（多平台 + GitHub 持久化版 EO 函数）
 //
 // 不依赖 EO 运行时与真实 GitHub：用 addEventListener 垫片捕获 fetch handler，
-// 内存 mock api.github.com 的 Contents API（一个假的仓库文件），逐个接口验证。
+// 内存 mock api.github.com 的 Contents API（按文件路径区分仓库文件），逐个接口验证。
 //
 // 运行：node scripts/test-eo-account-store.mjs   全部通过退出码 0，否则 1。
 
@@ -16,15 +16,22 @@ const ACCESS_KEY = 'test-access-key';
 const TOKEN = 'test-github-token';
 
 // ---------------------------------------------------------------------------
-// 内存中的假 GitHub 仓库：{ content(utf8) | null, sha }
+// 内存中的假 GitHub 仓库：path -> { content(utf8), sha }
 // ---------------------------------------------------------------------------
-const repo = { content: null, sha: null };
+const files = new Map();
 
 function b64encode(str) {
   return Buffer.from(str, 'utf8').toString('base64');
 }
 function b64decode(b64) {
   return Buffer.from(String(b64).replace(/\s+/g, ''), 'base64').toString('utf8');
+}
+
+/** 从 Contents API URL 提取仓库内文件路径。 */
+function contentsPath(url) {
+  const u = new URL(String(url));
+  const match = u.pathname.match(/^\/repos\/[^/]+\/[^/]+\/contents\/(.+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 /** mock fetch：只接管 api.github.com 的 Contents API，其余一律报错。 */
@@ -37,21 +44,26 @@ globalThis.fetch = async (url, options = {}) => {
   if (auth !== `Bearer ${TOKEN}`) {
     return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
   }
+  const filePath = contentsPath(url);
+  if (!filePath) {
+    return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+  }
+  const existing = files.get(filePath) || { content: null, sha: null };
   if (options.method === 'PUT') {
     const body = JSON.parse(options.body);
-    if (repo.sha && body.sha !== repo.sha) {
+    if (existing.sha && body.sha !== existing.sha) {
       return new Response(JSON.stringify({ message: 'sha mismatch' }), { status: 409 });
     }
-    repo.content = b64decode(body.content);
-    repo.sha = `sha-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return new Response(JSON.stringify({ content: { sha: repo.sha } }), { status: 200 });
+    const sha = `sha-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    files.set(filePath, { content: b64decode(body.content), sha });
+    return new Response(JSON.stringify({ content: { sha } }), { status: 200 });
   }
   // GET contents
-  if (repo.content === null) {
+  if (existing.content === null) {
     return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
   }
   return new Response(
-    JSON.stringify({ content: b64encode(repo.content), sha: repo.sha }),
+    JSON.stringify({ content: b64encode(existing.content), sha: existing.sha }),
     { status: 200 },
   );
 };
@@ -113,6 +125,7 @@ console.log('health / 鉴权 / CORS');
   const data = await resp.json();
   check('GET /health 无需 key', resp.status === 200 && data.ok === true);
   check('health 报告配置齐全', data.keyConfigured === true && data.repoConfigured === true);
+  check('health 列出四个平台', Array.isArray(data.platforms) && data.platforms.length === 4);
 
   const cors = await callEo('/accounts', { method: 'OPTIONS', key: null });
   check('OPTIONS 预检 204', cors.status === 204);
@@ -124,7 +137,7 @@ console.log('health / 鉴权 / CORS');
   check('错 key 401', badKey.status === 401);
 }
 
-console.log('空仓库读取与首次上传');
+console.log('空仓库读取与首次上传（codebuddy 默认平台）');
 {
   const resp = await callEo('/accounts');
   const data = await resp.json();
@@ -134,6 +147,7 @@ console.log('空仓库读取与首次上传');
   const result = await merge.json();
   check('首次合并成功', merge.status === 200 && result.ok === true, JSON.stringify(result));
   check('新增 2 个', result.added === 2 && result.total === 2);
+  check('写入默认文件', files.has('accounts.json'));
 
   const after = await callEo('/accounts');
   const accounts = await after.json();
@@ -155,6 +169,57 @@ console.log('按 id 合并（工作流回写场景）');
   check('a1 token 已轮换', a?.access_token === 'tok-a-NEW' && a?.refresh_token === 'ref-a-NEW');
   check('b2 原样保留', b?.access_token === 'tok-b');
   check('总数不变', accounts.length === 2);
+}
+
+console.log('多平台：WorkBuddy / Trae / Qoder');
+{
+  // WorkBuddy：凭证在 credential.access_token
+  const wb = { id: 'wb-1', uid: 'u-wb', credential: { access_token: 'wb-tok', refresh_token: 'wb-ref' } };
+  const wbMerge = await callEo('/accounts/merge?platform=workbuddy', { method: 'POST', body: [wb] });
+  const wbResult = await wbMerge.json();
+  check('WorkBuddy 合并成功', wbMerge.status === 200 && wbResult.platform === 'workbuddy');
+  check('WorkBuddy 写入独立文件', files.has('workbuddy-accounts.json'));
+  const wbBack = await (await callEo('/accounts?platform=workbuddy')).json();
+  check('WorkBuddy 读回 credential', wbBack[0]?.credential?.access_token === 'wb-tok');
+  check('WorkBuddy 不污染 codebuddy', (await (await callEo('/accounts')).json()).length === 2);
+
+  // WorkBuddy 缺凭证：请求体被判定无效
+  const wbBad = await callEo('/accounts/merge?platform=workbuddy', {
+    method: 'POST',
+    body: [{ id: 'wb-2', nickname: 'no-token' }],
+  });
+  check('WorkBuddy 缺凭证 400', wbBad.status === 400);
+
+  // Trae：凭证字段 cloudIdeJwt
+  const trae = { id: 'trae-1', userId: 'tu-1', cloudIdeJwt: 'jwt-token' };
+  const traeMerge = await callEo('/accounts/merge?platform=trae', { method: 'POST', body: [trae] });
+  check('Trae 合并成功', traeMerge.status === 200 && (await traeMerge.json()).platform === 'trae');
+  check('Trae 写入独立文件', files.has('trae-accounts.json'));
+  const traeBad = await callEo('/accounts/merge?platform=trae', {
+    method: 'POST',
+    body: [{ id: 'trae-2' }],
+  });
+  check('Trae 缺 cloudIdeJwt 400', traeBad.status === 400);
+
+  // Qoder：凭证在 credential.access_token
+  const qoder = { id: 'qd-1', credential: { access_token: 'dt-token' } };
+  const qoderMerge = await callEo('/accounts/merge?platform=qoder', { method: 'POST', body: [qoder] });
+  check('Qoder 合并成功', qoderMerge.status === 200 && (await qoderMerge.json()).platform === 'qoder');
+  check('Qoder 写入独立文件', files.has('qoder-accounts.json'));
+
+  // 平台概览
+  const overview = await (await callEo('/platforms')).json();
+  check('平台概览：codebuddy 2 个', overview.platforms.codebuddy.total === 2);
+  check('平台概览：workbuddy 1 个', overview.platforms.workbuddy.total === 1);
+  check('平台概览：trae 1 个', overview.platforms.trae.total === 1);
+  check('平台概览：qoder 1 个', overview.platforms.qoder.total === 1);
+  check('平台概览：可用计数', overview.platforms.trae.usable === 1);
+
+  // 未知平台
+  const unknown = await callEo('/accounts?platform=nope');
+  check('未知平台 400', unknown.status === 400);
+  const unknownMerge = await callEo('/accounts/merge?platform=nope', { method: 'POST', body: [ACC_A] });
+  check('未知平台合并 400', unknownMerge.status === 400);
 }
 
 console.log('异常输入');
