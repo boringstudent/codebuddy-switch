@@ -83,9 +83,11 @@ async function runPlatform(runner) {
   const usable = accounts.filter((account) => runner.module.isUsable(account));
   summary.total = usable.length;
   if (accounts.length > 0 && usable.length === 0) {
-    // 典型场景：EO 函数还是旧版，?platform= 被忽略，返回的是 CodeBuddy 账号库。
-    summary.error = '云端账号库里没有该平台可用凭证（若刚接入，请先部署多平台版 EO 函数并上传账号）';
-    console.error(`[${label}] ${summary.error}`);
+    // 账号库存在但全无可用凭证（token 为空/已失效），或 EO 仍是旧版导致结构不匹配。
+    // 这属于「没有可签到的账号」，不是签到失败：只提示，不计入退出码。
+    console.log(
+      `[${label}] 云端有 ${accounts.length} 个账号但均无可用凭证，跳过（凭证失效，或需部署多平台版 EO 函数）`,
+    );
     return summary;
   }
   if (usable.length === 0) {
