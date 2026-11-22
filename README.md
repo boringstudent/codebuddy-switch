@@ -63,6 +63,7 @@ WorkBuddy 与 CodeBuddy IDE 多账号切换桌面 App（Tauri，仅支持 Window
 
 - EO 函数代码在 `edge/eo-account-store.js`，部署步骤与环境变量说明见文件头注释（需要 `ACCESS_KEY` 与有私有仓库 Contents 读写权限的 `GITHUB_TOKEN`）；接口统一用 `?platform=<codebuddy|workbuddy|trae|qoder>` 选择平台，缺省 `codebuddy`；
 - 设置 →「云端账号同步」填入函数地址与访问 key，点「上传到云端」把 CodeBuddy 账号库合并推送上去；WorkBuddy / Trae / Qoder 账号用各自客户端导出后，经 `POST /accounts/merge?platform=<name>` 写入（结构保持导出原样，Trae 会补 `id` 供回写）；
+- 更新平台账号：`node scripts/upload-platform-accounts.mjs <导出文件> [--dry-run]`，自动识别 WorkBuddy / Trae / Qoder / CodeBuddy 导出并上传（Trae 自动补 `id`）；Qoder 含凭证的加密导出需设 `QODER_EXPORT_PASSWORD`（依赖本机 python + `argon2-cffi`、`cryptography`），明文只在内存中流转；
 - 签到工作流按平台独立拉取、独立签到、独立回写：临期先刷新 token（Trae 无刷新接口），签到结束后把新 token 按 id 合并回对应文件，`refresh_token` 轮换不会导致下次失效；
 - 工作流只需仓库 Secrets：`EO_ACCOUNTS_URL`（函数地址）与 `EO_ACCESS_KEY`（访问 key）；可选 `CHECKIN_PLATFORMS`（如 `codebuddy,trae`）限定平台；失败结果会发邮件汇报；
 - 改动 EO 函数后可本地验证逻辑：`node scripts/test-eo-account-store.mjs`（内存 mock GitHub API，覆盖鉴权 / 合并 / 回写 / 多平台隔离）。
