@@ -22,6 +22,13 @@ const b64 = (value) => Buffer.from(String(value), 'utf8').toString('base64');
 /** UTF-8 邮件头编码（主题等非 ASCII 场景必须）。 */
 const encodeHeader = (value) => `=?UTF-8?B?${b64(value)}?=`;
 
+/**
+ * base64 正文按 MIME 标准折行（每行 76 字符）。
+ * 不折行时单行超过 RFC 5321 的 998 字节上限，QQ 邮箱会拒收
+ * （500 Line too long, exceeds the 998-octet text line limit）。
+ */
+const wrapBase64 = (text) => b64(text).replace(/(.{76})/g, '$1\r\n').replace(/\r\n$/, '');
+
 class SmtpClient {
   constructor(socket) {
     this.socket = socket;
@@ -110,7 +117,7 @@ export async function sendMail({ host = 'smtp.qq.com', port = 465, user, pass, t
       'Content-Type: text/plain; charset=utf-8',
       'Content-Transfer-Encoding: base64',
       '',
-      b64(text),
+      wrapBase64(text),
       '.',
     ].join('\r\n');
     await client.command(message, ['250']);
