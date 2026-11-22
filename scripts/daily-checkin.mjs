@@ -65,6 +65,7 @@ async function runPlatform(runner) {
     total: 0,
     success: 0,
     already: 0,
+    skipped: 0,
     failed: 0,
     error: '',
     rows: [],
@@ -107,6 +108,11 @@ async function runPlatform(runner) {
         summary.already += 1;
         console.log(`[已签] ${label} · ${outcome.name}`);
         summary.rows.push({ name: outcome.name, result: '今日已签到' });
+      } else if (outcome.result === 'skip') {
+        summary.skipped += 1;
+        const reason = redact(outcome.message || '无可参与活动');
+        console.log(`[跳过] ${label} · ${outcome.name}：${reason}`);
+        summary.rows.push({ name: outcome.name, result: `跳过：${reason}` });
       } else {
         summary.failed += 1;
         const reason = redact(outcome.error || '未知错误');
@@ -147,13 +153,14 @@ async function main() {
     (acc, item) => ({
       success: acc.success + item.success,
       already: acc.already + item.already,
+      skipped: acc.skipped + item.skipped,
       failed: acc.failed + item.failed + (item.error && item.total === 0 ? 1 : 0),
     }),
-    { success: 0, already: 0, failed: 0 },
+    { success: 0, already: 0, skipped: 0, failed: 0 },
   );
 
   console.log(
-    `签到完成：成功 ${totals.success}，已签 ${totals.already}，失败 ${totals.failed}（${summaries
+    `签到完成：成功 ${totals.success}，已签 ${totals.already}，跳过 ${totals.skipped}，失败 ${totals.failed}（${summaries
       .map((s) => `${s.label}:${s.total}`)
       .join(' / ')}）`,
   );
@@ -168,10 +175,10 @@ async function sendReportMail(summaries, totals) {
     return;
   }
   const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-  const summary = `成功 ${totals.success}，已签 ${totals.already}，失败 ${totals.failed}`;
+  const summary = `成功 ${totals.success}，已签 ${totals.already}，跳过 ${totals.skipped}，失败 ${totals.failed}`;
   const lines = [];
   for (const platform of summaries) {
-    const head = `${platform.label}（${platform.total} 个账号：成功 ${platform.success}，已签 ${platform.already}，失败 ${platform.failed}）`;
+    const head = `${platform.label}（${platform.total} 个账号：成功 ${platform.success}，已签 ${platform.already}，跳过 ${platform.skipped}，失败 ${platform.failed}）`;
     lines.push(head);
     if (platform.error) lines.push(`  云端读取：${platform.error}`);
     for (const row of platform.rows) lines.push(`  ${row.name}：${row.result}`);

@@ -247,12 +247,20 @@ export async function checkinAccount(rawAccount) {
     const already = await alreadyClaimedToday(account, list.campaigns, nowSecs);
     if (already) return { name, result: 'already', account, tokensChanged };
     const hasDaily = list.campaigns.some((c) => isDailyCredits(c) && inWindow(c, nowSecs));
+    if (!hasDaily) {
+      // 活动未开档不是签到失败：服务端当天确实没有可领权益，报跳过避免工作流每天标红。
+      return {
+        name,
+        result: 'skip',
+        message: '当前无每日积分活动（只有浏览类活动，等待官方开档）',
+        account,
+        tokensChanged,
+      };
+    }
     return {
       name,
       result: 'error',
-      error: hasDaily
-        ? '每日积分活动已结束或本账号无领取资格'
-        : '当前无每日积分活动（活动列表只有浏览类活动，等待官方开档）',
+      error: '每日积分活动已结束或本账号无领取资格',
       account,
       tokensChanged,
     };
